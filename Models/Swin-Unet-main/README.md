@@ -1,4 +1,57 @@
 # Swin-Unet
+[Custom HPC Edition by Nitesh Kumar Shah]
+
+## HPC Usage and SLURM Job Submission
+
+This repository has been adapted for use on Linux-based HPC clusters with SLURM workload manager. Example SLURM scripts (`training.sh`, `train.sh`, `test.sh`) are provided for batch job submission.
+
+### To train and test on HPC:
+
+1. Edit `training.sh` to match your environment (Python module, CUDA version, dataset paths, etc).
+2. Submit the job:
+       ```bash
+       sbatch training.sh
+       ```
+3. Monitor your job with:
+       ```bash
+       squeue -u $USER
+       tail -f logs/train_test_<jobid>.out
+       ```
+
+### Dataset Structure
+
+Datasets should be placed in the `U-DIADS-Bib-MS/` directory, with the following structure:
+
+```
+U-DIADS-Bib-MS/
+      Latin14396/
+            img-Latin14396/
+                  training/
+                  validation/
+                  test/
+            pixel-level-gt-Latin14396/
+                  training/
+                  validation/
+                  test/
+      ...
+```
+
+### Model Checkpoints and Outputs
+
+Model checkpoints and outputs are saved in `model_out/` and `test_log/` directories. These are excluded from git by `.gitignore`.
+
+### Requirements
+
+- Python 3.12 (via module: `python/pytorch2.6py3.12`)
+- PyTorch 2.6
+- CUDA 11.8
+- cuDNN
+- All other dependencies: `pip install -r requirements.txt`
+
+### Notes
+- All scripts and paths use Linux-style `/` separators.
+- Large datasets, images, and checkpoints are not tracked by git.
+- For any issues, contact: Nitesh Kumar Shah (nitesh.shah@fau.de)
 [ECCVW2022] The codes for the work "Swin-Unet: Unet-like Pure Transformer for Medical Image Segmentation"(https://arxiv.org/abs/2105.05537). Our paper has been accepted by ECCV 2022 MEDICAL COMPUTER VISION WORKSHOP (https://mcv-workshop.github.io/). We updated the Reproducibility. I hope this will help you to reproduce the results.
 
 ## 1. Download pre-trained swin transformer model (Swin-T)
