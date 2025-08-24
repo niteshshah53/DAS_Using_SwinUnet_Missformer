@@ -184,11 +184,31 @@ def trainer_synapse(args, model, snapshot_path, train_dataset=None, val_dataset=
 
         # Save best model
         if val_loss < best_val_loss:
+            # Always save the latest best checkpoint to a fixed filename
+            latest_best_path = os.path.join(snapshot_path, "best_model_latest.pth")
+            torch.save(model.state_dict(), latest_best_path)
             best_val_loss = val_loss
             save_path = os.path.join(snapshot_path, f"best_model_epoch{epoch+1}.pth")
             torch.save(model.state_dict(), save_path)
             print(f"✓ Best model saved at epoch {epoch+1} with val loss {val_loss:.4f}")
             print("-"*80)
+
+            # Keep only the 3 latest/best checkpoints
+            import glob
+            import re
+            checkpoint_files = glob.glob(os.path.join(snapshot_path, "best_model_epoch*.pth"))
+            # Extract epoch number from filename
+            def extract_epoch(fname):
+                match = re.search(r"best_model_epoch(\\d+)\\.pth", fname)
+                return int(match.group(1)) if match else -1
+            # Sort by epoch descending (latest first)
+            checkpoint_files.sort(key=extract_epoch, reverse=True)
+            # Remove files after the 3 most recent
+            for ckpt in checkpoint_files[3:]:
+                try:
+                    os.remove(ckpt)
+                except Exception:
+                    pass
         else:
             print("-"*80)
 
