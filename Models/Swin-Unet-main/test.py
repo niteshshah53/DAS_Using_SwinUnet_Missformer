@@ -284,15 +284,10 @@ def inference(args, model, test_save_path=None):
                 
                 if orig_img_path:
                     orig_img = Image.open(orig_img_path).convert("RGB")
-                    orig_img_np = np.array(orig_img)
-                    # Resize if dimensions don't match
-                    if orig_img_np.shape[:2] != pred_full.shape:
-                        orig_img_np_resized = np.zeros((pred_full.shape[0], pred_full.shape[1], 3), dtype=np.uint8)
-                        min_h = min(orig_img_np.shape[0], pred_full.shape[0])
-                        min_w = min(orig_img_np.shape[1], pred_full.shape[1])
-                        orig_img_np_resized[:min_h, :min_w] = orig_img_np[:min_h, :min_w]
-                        orig_img_np = orig_img_np_resized
-                    axs[0].imshow(orig_img_np)
+                    # Always resize original image to match prediction size using high-quality interpolation
+                    if orig_img.size != (pred_full.shape[1], pred_full.shape[0]):
+                        orig_img = orig_img.resize((pred_full.shape[1], pred_full.shape[0]), Image.BILINEAR)
+                    axs[0].imshow(np.array(orig_img))
                 else:
                     # Create a blank image if original not found
                     axs[0].imshow(np.zeros((pred_full.shape[0], pred_full.shape[1], 3), dtype=np.uint8))
@@ -427,16 +422,11 @@ if __name__ == "__main__":
     net = get_model(args, config)
 
 
-    # Find best model checkpoint for UDIADS_BIB
+    # Always load the best_model_latest.pth for Swin-Unet (UDIADS_BIB dataset)
     if args.dataset.lower() == "udiads_bib":
-        # Find the best_model_epoch*.pth file with the highest epoch
-        import glob
-        ckpts = glob.glob(os.path.join(args.output_dir, 'best_model_epoch*.pth'))
-        if not ckpts:
-            raise FileNotFoundError("No best_model_epoch*.pth found in output_dir")
-        # Use the one with the highest epoch number
-        ckpt = sorted(ckpts, key=lambda x: int(x.split('epoch')[-1].split('.')[0]))[-1]
-        snapshot = ckpt
+        snapshot = os.path.join(args.output_dir, 'best_model_latest.pth')
+        if not os.path.exists(snapshot):
+            raise FileNotFoundError("best_model_latest.pth not found in output_dir")
     else:
         snapshot = os.path.join(args.output_dir, 'best_model.pth')
         if not os.path.exists(snapshot):

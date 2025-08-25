@@ -1,55 +1,41 @@
+import os
+from PIL import Image
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+import random
+
+
 import torchvision.transforms.functional as TF
 from torchvision import transforms as tvtf
 
 # Default transform for resizing images and masks to 224x224
-import random
 def default_transform(image, mask_class, img_size=(448, 448)):
     # Resize
     image = image.resize(img_size, Image.BILINEAR)
     mask_class = Image.fromarray(mask_class.astype(np.uint8)).resize(img_size, Image.NEAREST)
     mask_class = np.array(mask_class)
 
-    # Color jitter (only image)
-    if random.random() > 0.5:
-        color_jitter = tvtf.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1)
-        image = color_jitter(image)
-
-    # Random crop (with padding if needed)
-    if random.random() > 0.5:
-        crop_size = int(img_size[0] * 0.85)  # slightly smaller than patch size
-        i = random.randint(0, img_size[1] - crop_size)
-        j = random.randint(0, img_size[0] - crop_size)
-        image = image.crop((j, i, j + crop_size, i + crop_size))
-        mask_class = mask_class[i:i+crop_size, j:j+crop_size]
-        # Resize back to patch size
-        image = image.resize(img_size, Image.BILINEAR)
-        mask_class = Image.fromarray(mask_class.astype(np.uint8)).resize(img_size, Image.NEAREST)
-        mask_class = np.array(mask_class)
-
-    # Random horizontal flip
-    if random.random() > 0.5:
+    # Random horizontal flip (p=0.5)
+    if random.random() >= 0.5:
         image = image.transpose(Image.FLIP_LEFT_RIGHT)
         mask_class = np.fliplr(mask_class)
-    # Random vertical flip
-    if random.random() > 0.5:
+
+    # Random vertical flip (p=0.5)
+    if random.random() >= 0.5:
         image = image.transpose(Image.FLIP_TOP_BOTTOM)
         mask_class = np.flipud(mask_class)
-    # Random rotation (0, 90, 180, 270 or small angle)
-    angle = random.choice([0, 90, 180, 270, random.uniform(-20, 20)])
-    if angle != 0:
+
+    # Random rotation by 90, 180, or 270 degrees (p=0.5)
+    if random.random() >= 0.5:
+        angle = random.choice([90, 180, 270])
         image = image.rotate(angle, resample=Image.BILINEAR)
         mask_class = Image.fromarray(mask_class.astype(np.uint8)).rotate(angle, resample=Image.NEAREST)
         mask_class = np.array(mask_class)
 
     mask_class = mask_class.copy()
     return image, mask_class
-import os
-from PIL import Image
-import numpy as np
-import torch
-from torch.utils.data import Dataset
 
-# U-DIADS-Bib color to class index mapping
 # U-DIADS-Bib color to class index mapping
 COLOR_MAP = {
     (0, 0, 0): 0,         # Background

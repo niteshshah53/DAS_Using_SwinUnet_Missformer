@@ -26,13 +26,13 @@ conda activate pytorch2.6-py3.12
 python3 train.py \
     --model swinunet \
     --dataset UDIADS_BIB \
-    --udiadsbib_root "U-DIADS-Bib-MS_patched/Latin14396" \
+    --udiadsbib_root "U-DIADS-Bib-MS_patched/Latin2" \
     --udiadsbib_split training \
     --img_size 224 \
     --num_classes 6 \
-    --output_dir ./model_out/udiadsbib_patch224_swinunet_Latin14396 \
-    --max_epochs 300 \
-    --batch_size 32 \
+    --output_dir ./model_out/udiadsbib_patch224_swinunet_Latin2 \
+    --max_epochs 20 \
+    --batch_size 30 \
     --cfg configs/swin_tiny_patch4_window7_224_lite.yaml \
     --use_patched_data
 

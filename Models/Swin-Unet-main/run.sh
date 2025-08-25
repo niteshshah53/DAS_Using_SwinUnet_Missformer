@@ -22,7 +22,7 @@ mkdir -p logs
 
 conda activate pytorch2.6-py3.12
 
-MANUSCRIPTS=(Latin14396 Latin16746 Latin2 Syr341)
+MANUSCRIPTS=(Latin2 Latin14396 Latin16746 Syr341)
 
 for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
     echo "=== Training $MANUSCRIPT ==="
