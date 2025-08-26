@@ -114,10 +114,9 @@ def trainer_synapse(args, model, snapshot_path, train_dataset=None, val_dataset=
                 labels = batch[1].cuda()
             outputs = model(images)
             loss_ce = ce_loss(outputs, labels)
-            loss_focal = focal_loss(outputs, labels)
             loss_dice = dice_loss(outputs, labels)
-            # Main loss: Weighted sum (CE, Focal, Dice) - more weight to Focal/Dice
-            loss = 0.05 * loss_ce + 0.475 * loss_focal + 0.475 * loss_dice
+            # Baseline A: Weighted sum (CE + Dice)
+            loss = 0.5 * loss_ce + 0.5 * loss_dice
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
