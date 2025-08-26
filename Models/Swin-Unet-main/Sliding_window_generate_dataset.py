@@ -22,8 +22,8 @@ def process_manuscript_split(manuscript_name, split_name):
     print(f"Processing manuscript: {manuscript_name}, split: {split_name}")
     
     # Set paths for current manuscript and split based on actual directory structure
-    ip = f'U-DIADS-Bib-MS/{manuscript_name}/img-{manuscript_name}/{split_name}'
-    mp = f'U-DIADS-Bib-MS/{manuscript_name}/pixel-level-gt-{manuscript_name}/{split_name}'
+    ip = os.path.join('U-DIADS-Bib-MS', manuscript_name, f'img-{manuscript_name}', split_name)
+    mp = os.path.join('U-DIADS-Bib-MS', manuscript_name, f'pixel-level-gt-{manuscript_name}', split_name)
     
     # Skip if input directory doesn't exist
     if not os.path.exists(ip) or not os.path.exists(mp):
@@ -31,8 +31,8 @@ def process_manuscript_split(manuscript_name, split_name):
         return
     
     # Create output directories with new structure
-    save_path_context = f'U-DIADS-Bib-MS_patched/{manuscript_name}/Image/{split_name}'
-    save_path_context_mask = f'U-DIADS-Bib-MS_patched/{manuscript_name}/mask/{split_name}_labels'
+    save_path_context = os.path.join('U-DIADS-Bib-MS_patched', manuscript_name, 'Image', split_name)
+    save_path_context_mask = os.path.join('U-DIADS-Bib-MS_patched', manuscript_name, 'mask', f"{split_name}_labels")
     
     if not os.path.exists(save_path_context):
         os.makedirs(save_path_context)
@@ -57,7 +57,7 @@ def process_manuscript_split(manuscript_name, split_name):
     # Process all images
     for i in range(len(images)):
         image = Image.open(images[i])
-        suffix = images[i].split('/')[-1].split('.')[0]
+        suffix = os.path.splitext(os.path.basename(images[i]))[0]
         toimage = totensor(image)
         _, h, w = toimage.shape
         id = 0
@@ -65,14 +65,14 @@ def process_manuscript_split(manuscript_name, split_name):
             for x in range(0, w + 1, target_size):
                 if y + interval <= h and x + interval <= w:
                     crop = toimage[:, y:y + interval, x:x + interval]
-                    save_image(crop, os.path.join(save_path_context, suffix + '_{:06d}.png'.format(id)))
+                    save_image(crop, os.path.join(save_path_context, f"{suffix}_{id:06d}.png"))
                     id += 1
         print(f"Processed image {i+1}/{len(images)}: {suffix} - created {id} patches")
     
     # Process all masks
     for i in range(len(masks)):
         mask = Image.open(masks[i])
-        suffix = masks[i].split('/')[-1].split('.')[0]
+        suffix = os.path.splitext(os.path.basename(masks[i]))[0]
         toimage = totensor(mask)
         _, h, w = toimage.shape
         id = 0
@@ -80,7 +80,7 @@ def process_manuscript_split(manuscript_name, split_name):
             for x in range(0, w + 1, target_size):
                 if y + interval <= h and x + interval <= w:
                     crop = toimage[:, y:y + interval, x:x + interval]
-                    save_image(crop, os.path.join(save_path_context_mask, suffix + '_{:06d}'.format(id) + '_zones_NA.png'))
+                    save_image(crop, os.path.join(save_path_context_mask, f"{suffix}_{id:06d}_zones_NA.png"))
                     id += 1
         print(f"Processed mask {i+1}/{len(masks)}: {suffix} - created {id} patches")
 

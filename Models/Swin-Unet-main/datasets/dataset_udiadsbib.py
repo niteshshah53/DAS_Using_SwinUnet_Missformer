@@ -8,8 +8,9 @@ import random
 
 import torchvision.transforms.functional as TF
 from torchvision import transforms as tvtf
+from functools import partial
+import multiprocessing
 
-# Default transform for resizing images and masks to 224x224
 def default_transform(image, mask_class, img_size=(448, 448)):
     # Resize
     image = image.resize(img_size, Image.BILINEAR)
@@ -35,6 +36,13 @@ def default_transform(image, mask_class, img_size=(448, 448)):
 
     mask_class = mask_class.copy()
     return image, mask_class
+
+# Top-level transform functions for Windows compatibility
+def training_transform(img, mask, patch_size):
+    return default_transform(img, mask, img_size=(patch_size, patch_size))
+
+def identity_transform(img, mask):
+    return img, mask
 
 # U-DIADS-Bib color to class index mapping
 COLOR_MAP = {
@@ -64,14 +72,13 @@ class UDiadsBibDataset(Dataset):
         self.patch_size = patch_size if not use_patched_data and split == 'training' else None
         self.stride = stride if not use_patched_data and split == 'training' else None
         
-        # Set up the transform
+        # Set up the transform (no lambdas, only top-level functions)
         if transform is None:
             if split == 'training':
-                # Use high-res patch size for training
-                self.transform = lambda img, mask: default_transform(img, mask, img_size=(patch_size, patch_size))
+                # bind patch_size so the transform is a picklable top-level callable
+                self.transform = partial(training_transform, patch_size=patch_size)
             else:
-                # For val/test, do not resize or augment, just return as is (for sliding window inference)
-                self.transform = lambda img, mask: (img, mask)
+                self.transform = identity_transform
         else:
             self.transform = transform
             
@@ -121,16 +128,19 @@ class UDiadsBibDataset(Dataset):
         img_dir = f'{base_dir}/{manuscript}/Image/{self.split}'
         mask_dir = f'{base_dir}/{manuscript}/mask/{self.split}_labels'
         
-        print(f"Looking for images in: {img_dir}")
-        print(f"Looking for masks in: {mask_dir}")
+        if multiprocessing.current_process().name == 'MainProcess':
+            print(f"Looking for images in: {img_dir}")
+            print(f"Looking for masks in: {mask_dir}")
         
         if not os.path.exists(img_dir) or not os.path.exists(mask_dir):
-            print(f"Warning: One of the directories does not exist!")
+            if multiprocessing.current_process().name == 'MainProcess':
+                print(f"Warning: One of the directories does not exist!")
             return [], []
             
         # Get all patch images
         patch_imgs = sorted(glob.glob(os.path.join(img_dir, '*.png')))
-        print(f"Found {len(patch_imgs)} patch images")
+        if multiprocessing.current_process().name == 'MainProcess':
+            print(f"Found {len(patch_imgs)} patch images")
         
         for img_path in patch_imgs:
             # Extract the base name (without extension)
@@ -145,7 +155,8 @@ class UDiadsBibDataset(Dataset):
                 img_paths.append(img_path)
                 mask_paths.append(mask_path)
         
-        print(f"Successfully matched {len(img_paths)} image-mask pairs")
+        if multiprocessing.current_process().name == 'MainProcess':
+            print(f"Successfully matched {len(img_paths)} image-mask pairs")
         return img_paths, mask_paths
             
         return img_paths, mask_paths

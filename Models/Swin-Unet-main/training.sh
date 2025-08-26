@@ -31,8 +31,8 @@ python3 train.py \
     --img_size 224 \
     --num_classes 6 \
     --output_dir ./model_out/udiadsbib_patch224_swinunet_Latin2 \
-    --max_epochs 20 \
-    --batch_size 30 \
+    --max_epochs 3 \
+    --batch_size 32 \
     --cfg configs/swin_tiny_patch4_window7_224_lite.yaml \
     --use_patched_data
 

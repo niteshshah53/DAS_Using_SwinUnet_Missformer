@@ -91,6 +91,17 @@ parser.add_argument("--eval_interval", default=1, type=int)
 
 args = parser.parse_args()
 
+# Quick safety check: detect accidental paste fragments like 'mg_size' that become standalone argv tokens
+bad_tokens = [t for t in sys.argv[1:] if t.lstrip('-').startswith('mg_') or t.lstrip('-').startswith('mg')]
+if bad_tokens:
+    print(f"Warning: suspicious argv tokens detected: {bad_tokens}\nDid you accidentally paste a continuation fragment? Use a single-line command or PowerShell backtick (`) correctly.")
+
+# Normalize class argument names so callers can use either --num_classes or --n_class
+args.num_classes = getattr(args, 'num_classes', getattr(args, 'n_class', None))
+args.n_class = getattr(args, 'n_class', args.num_classes)
+if args.num_classes is None:
+    raise ValueError('Please provide --num_classes (or --n_class).')
+
 if args.dataset.lower() == "udiads_bib":
     args.num_classes = 6
     train_dataset = UDiadsBibDataset(

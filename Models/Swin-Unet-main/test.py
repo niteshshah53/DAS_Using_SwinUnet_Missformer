@@ -76,6 +76,18 @@ parser.add_argument("--split_name", default="test", help="Directory of the input
 
 args = parser.parse_args()
 
+# Quick safety check: detect accidental paste fragments like 'mg_size' that become standalone argv tokens
+import sys as _sys
+_bad_tokens = [t for t in _sys.argv[1:] if t.lstrip('-').startswith('mg_') or t.lstrip('-').startswith('mg')]
+if _bad_tokens:
+    print(f"Warning: suspicious argv tokens detected: {_bad_tokens}\nDid you accidentally paste a continuation fragment? Use a single-line command or PowerShell backtick (`) correctly.")
+
+# Normalize class argument names for compatibility
+args.num_classes = getattr(args, 'num_classes', getattr(args, 'n_class', None))
+args.n_class = getattr(args, 'n_class', args.num_classes)
+if args.num_classes is None:
+    raise ValueError('Please provide --num_classes (or --n_class).')
+
 if args.dataset == "Synapse":
     args.volume_path = os.path.join(args.volume_path, "test_vol_h5")
 config = get_config(args)
