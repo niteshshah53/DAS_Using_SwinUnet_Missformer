@@ -227,5 +227,3 @@ def trainer_synapse(args, model, snapshot_path, train_dataset=None, val_dataset=
     print("="*80 + "\n")
     
     writer.close()
-
-

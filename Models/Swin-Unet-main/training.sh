@@ -22,18 +22,29 @@ mkdir -p logs
 
 conda activate pytorch2.6-py3.12
 
-# --- Run training with SwinUnet ---
-python3 train.py \
-    --model swinunet \
-    --dataset UDIADS_BIB \
-    --udiadsbib_root "U-DIADS-Bib-MS_patched/Latin2" \
-    --udiadsbib_split training \
-    --img_size 224 \
-    --num_classes 6 \
-    --output_dir ./model_out/udiadsbib_patch224_swinunet_Latin2 \
-    --max_epochs 30 \
-    --batch_size 32 \
-    --cfg configs/swin_tiny_patch4_window7_224_lite.yaml \
-    --use_patched_data
+# --- Run training for multiple manuscripts ---
+# Manuscripts to train on
+manuscripts=("Latin2" "Latin14396" "Latin16746" "Syr341")
+
+for m in "${manuscripts[@]}"; do
+    echo "=== Training $m ==="
+    python3 train.py \
+        --cfg configs/swin_tiny_patch4_window7_224_lite.yaml \
+        --model swinunet \
+        --dataset UDIADS_BIB \
+        --udiadsbib_root "U-DIADS-Bib-FS_patched/${m}" \
+        --use_patched_data \
+        --img_size 224 \
+        --num_classes 6 \
+        --batch_size 32 \
+        --max_epochs 30 \
+        --output_dir "./model_out/udiadsbib_patch224_swinunet_${m}"
+
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "train.py failed for $m with exit code $rc"
+        break
+    fi
+done
 
 

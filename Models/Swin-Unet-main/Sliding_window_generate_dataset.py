@@ -123,4 +123,3 @@ if __name__ == "__main__":
             process_manuscript_split(manuscript_name, split_name)
     
     print("All manuscripts and splits processed successfully!")
-

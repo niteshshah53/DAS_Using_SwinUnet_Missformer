@@ -17,22 +17,30 @@ module load python/pytorch2.6py3.12
 module load cuda/11.8
 module load cudnn
 
-# Create logs directory
+# Create logs directory  "Latin14396" "Latin16746" "Syr341"
 mkdir -p logs
 
 conda activate pytorch2.6-py3.12
 
-# --- Run testing with SwinUnet for Latin2 ---
-python3 test.py \
-    --model swinunet \
-    --dataset UDIADS_BIB \
-    --udiadsbib_root "U-DIADS-Bib-MS_patched" \
-    --udiadsbib_split test \
-    --manuscript "Latin14396" \
-    --img_size 224 \
-    --cfg configs/swin_tiny_patch4_window7_224_lite.yaml \
-    --num_classes 6 \
-    --output_dir "./model_out/udiadsbib_patch224_swinunet_Latin14396" \
-    --is_savenii \
-    --use_postprocessing \
-    --use_patched_data 
+# --- Run testing for multiple manuscripts ---
+manuscripts=("Latin2")
+
+for m in "${manuscripts[@]}"; do
+    echo "=== Testing $m ==="
+    python3 test.py \
+        --cfg configs/swin_tiny_patch4_window7_224_lite.yaml \
+        --model swinunet \
+        --dataset UDIADS_BIB \
+        --udiadsbib_root "U-DIADS-Bib-MS_patched" \
+        --manuscript $m \
+        --use_patched_data \
+        --is_savenii \
+        --img_size 2016 \
+        --num_classes 6 \
+        --output_dir "./model_out/udiadsbib_patch224_swinunet_${m}"
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "test.py failed for $m with exit code $rc"
+        break
+    fi
+done
