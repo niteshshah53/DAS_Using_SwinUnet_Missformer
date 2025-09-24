@@ -18,7 +18,9 @@ import sys
 import glob
 import re
 import warnings
+import numpy as np
 from PIL import Image
+
 
 import torch
 import torch.nn as nn
@@ -83,52 +85,55 @@ def setup_logging(output_path):
     
     return logger
 
-
-import numpy as np
-from PIL import Image
-import torch
-
 def compute_class_weights(train_dataset, num_classes):
     """
     Compute class weights for balanced training based on pixel frequency.
-    Matches the original implementation from trainer_synapse.
-    
     Args:
         train_dataset: Training dataset object with .mask_paths
         num_classes (int): Number of segmentation classes
-        
     Returns:
-        torch.Tensor: Normalized class weights for loss function (on CUDA if available)
+        torch.Tensor: Class weights (on CUDA if available)
     """
     print("\nComputing class weights...")
 
-    # Color mapping for U-DIADS-Bib dataset (same as original code)
-    COLOR_MAP = {
-        (0, 0, 0): 0,        # Background
-        (255, 255, 0): 1,    # Paratext
-        (0, 255, 255): 2,    # Decoration
-        (255, 0, 255): 3,    # Main text
-        (255, 0, 0): 4,      # Title
-        (0, 255, 0): 5,      # Chapter Heading
-    }
+    # Define color maps for different datasets
+    if num_classes == 6:
+        # UDIADS-BIB color map
+        COLOR_MAP = {
+            (0, 0, 0): 0,        # Background
+            (255, 255, 0): 1,    # Paratext
+            (0, 255, 255): 2,    # Decoration
+            (255, 0, 255): 3,    # Main text
+            (255, 0, 0): 4,      # Title
+            (0, 255, 0): 5,      # Chapter Heading
+        }
+    elif num_classes == 4:
+        # DivaHisDB color map
+        COLOR_MAP = {
+            (0, 0, 0): 0,        # Background
+            (0, 255, 0): 1,      # Comment
+            (255, 0, 0): 2,      # Decoration
+            (0, 0, 255): 3,      # Main Text
+        }
+    else:
+        raise ValueError(f"Unsupported number of classes: {num_classes}")
 
     class_counts = np.zeros(num_classes, dtype=np.float64)
 
-    # Count pixels for each class across all training masks
     for mask_path in train_dataset.mask_paths:
-        mask = Image.open(mask_path).convert("RGB")
-        mask = np.array(mask)
-
+        mask = np.array(Image.open(mask_path).convert("RGB"))
         for rgb, cls in COLOR_MAP.items():
             matches = np.all(mask == rgb, axis=-1)
             class_counts[cls] += matches.sum()
 
-    # Compute class frequencies and weights
+    # Compute frequencies
     class_freq = class_counts / class_counts.sum()
-    weights = 1.0 / (class_freq + 1e-6)
-    weights = weights / weights.sum()  # Normalize
 
-    # Print class distribution analysis (exact format from original)
+    # Inverse frequency (no normalization)
+    #weights = np.where(class_freq > 0, 1.0 / (class_freq + 1e-6), 0.0)
+    weights = np.log(1.0 + (1.0 / (class_freq + 1e-6)))
+
+    # Print
     print("\n" + "-"*80)
     print("CLASS DISTRIBUTION ANALYSIS")
     print("-"*80)
@@ -138,8 +143,10 @@ def compute_class_weights(train_dataset, num_classes):
         print(f"{cls:<6} {class_freq[cls]:<15.6f} {weights[cls]:<15.6f}")
     print("-"*80 + "\n")
 
-    # Return as CUDA tensor if available
-    return torch.tensor(weights, dtype=torch.float32).cuda()
+    # Return as tensor
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.tensor(weights, dtype=torch.float32, device=device)
+
 
 
 
@@ -217,8 +224,9 @@ def create_optimizer_and_scheduler(model, learning_rate, args=None):
     
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=0.0001,  # Use the passed learning rate instead of hardcoded 0.001
-        weight_decay=0.01  # Helps prevent overfitting
+        lr=learning_rate,  # Use the passed learning rate instead of hardcoded 0.001
+        weight_decay=1e-4,   # Helps prevent overfitting
+        betas=(0.9, 0.999) # Helps prevent overfitting
     )
     
     # NEW: ReduceLROnPlateau scheduler - reduces learning rate when validation loss plateaus
@@ -228,9 +236,7 @@ def create_optimizer_and_scheduler(model, learning_rate, args=None):
         mode='min',           # Monitor validation loss (minimize)
         factor=getattr(args, 'lr_factor', 0.5),      # Reduce LR by this factor when plateauing
         patience=getattr(args, 'lr_patience', 10),   # Wait this many epochs before reducing LR
-        min_lr=getattr(args, 'lr_min', 1e-7),       # Minimum learning rate
-        threshold=getattr(args, 'lr_threshold', 1e-4), # Minimum change to be considered improvement
-        threshold_mode='rel'  # Relative threshold (percentage change)
+        min_lr=getattr(args, 'lr_min', 1e-7)       # Minimum learning rate
     )
     
     # OLD: Exponential decay scheduler (commented out but preserved)
@@ -240,7 +246,6 @@ def create_optimizer_and_scheduler(model, learning_rate, args=None):
     print(f"  - Factor: {getattr(args, 'lr_factor', 0.5)} (reduce LR by this factor)")
     print(f"  - Patience: {getattr(args, 'lr_patience', 10)} epochs")
     print(f"  - Min LR: {getattr(args, 'lr_min', 1e-7)}")
-    print(f"  - Threshold: {getattr(args, 'lr_threshold', 1e-4)} (relative)")
     print(f"  - Note: Learning rate changes will be logged automatically")
     
     return optimizer, scheduler
@@ -281,7 +286,10 @@ def run_training_epoch(model, train_loader, ce_loss, focal_loss, dice_loss, opti
         
         # Combined loss (weighted combination)
         # We give more weight to focal and dice losses as they work better for segmentation
-        loss = 0.05 * loss_ce + 0.475 * loss_focal + 0.475 * loss_dice
+        #loss = 0.2 * loss_ce + 0.3 * loss_focal + 0.5 * loss_dice
+        #loss = 0.4 * loss_ce + 0.00 * loss_focal + 0.6 * loss_dice # Combined loss (weighted combination) for swinunet and missformer
+        loss = 0.00 * loss_ce + 0.4 * loss_focal + 0.6 * loss_dice # Combined loss (weighted combination) for sstrans
+        #loss = 0.00 * loss_ce + 0.3 * loss_focal + 0.7 * loss_dice # Combined loss (weighted combination) for sstrans
         
         # Backward pass and optimization
         optimizer.zero_grad()
@@ -326,7 +334,8 @@ def validate_with_sliding_window(model, val_dataset, ce_loss, focal_loss, dice_l
             height, width = img_array.shape[:2]
             
             # Initialize prediction and count maps
-            prediction_map = np.zeros((height, width, model.module.num_classes if hasattr(model, 'module') else 6))
+            num_classes = model.module.num_classes if hasattr(model, 'module') else model.num_classes
+            prediction_map = np.zeros((height, width, num_classes))
             count_map = np.zeros((height, width))
             
             # Sliding window over the image
@@ -349,8 +358,15 @@ def validate_with_sliding_window(model, val_dataset, ce_loss, focal_loss, dice_l
             prediction_map = prediction_map / count_map
             
             # Convert ground truth mask to class indices
-            from datasets.dataset_udiadsbib import rgb_to_class
-            ground_truth = rgb_to_class(mask_array)
+            # Use the appropriate conversion function based on dataset type
+            if hasattr(val_dataset, '__class__') and 'DivaHisDB' in val_dataset.__class__.__name__:
+                # For DivaHisDB dataset, use DivaHisDB conversion
+                from datasets.dataset_divahisdb import decode_bitmask_mask
+                ground_truth = decode_bitmask_mask(mask_array)
+            else:
+                # For UDIADS-BIB or other datasets, use UDIADS-BIB conversion
+                from datasets.dataset_udiadsbib import rgb_to_class
+                ground_truth = rgb_to_class(mask_array)
             
             # Compute loss on full image
             pred_tensor = torch.from_numpy(prediction_map.transpose(2, 0, 1)).unsqueeze(0).float().cuda()
@@ -360,7 +376,7 @@ def validate_with_sliding_window(model, val_dataset, ce_loss, focal_loss, dice_l
             loss_focal = focal_loss(pred_tensor, gt_tensor)
             loss_dice = dice_loss(pred_tensor, gt_tensor, softmax=True)
             # Use SAME loss weighting as training for consistency
-            loss = 0.05 * loss_ce + 0.475 * loss_focal + 0.475 * loss_dice
+            loss = 0.00 * loss_ce + 0.4 * loss_focal + 0.6 * loss_dice
             
             val_loss += loss.item()
     
@@ -471,9 +487,8 @@ def trainer_synapse(args, model, snapshot_path, train_dataset=None, val_dataset=
         args.seed
     )
     
-    # Compute class weights for balanced training (U-DIADS-Bib only)
-    if (hasattr(train_dataset, 'mask_paths') and 
-        args.dataset.lower() == 'udiads_bib'):
+    # Compute class weights for balanced training (both UDIADS_BIB and DIVAHISDB)
+    if hasattr(train_dataset, 'mask_paths'):
         class_weights = compute_class_weights(train_dataset, args.num_classes)
     else:
         class_weights = torch.ones(args.num_classes)

@@ -1,11 +1,11 @@
 #!/bin/bash -l
-#SBATCH --job-name=das_train_test_diva
-#SBATCH --output=All_Results_with_No_FocalLoss/missformer/DIVAHISDB/train_test_all_%j.out
-#SBATCH --error=All_Results_with_No_FocalLoss/missformer/DIVAHISDB/train_test_all_%j.out
+#SBATCH --job-name=das_train_test_sstrans
+#SBATCH --output=All_Results_with_FocalLoss_DiceLoss/sstrans/DIVAHISDB/train_test_all_%j.out
+#SBATCH --error=All_Results_with_FocalLoss_DiceLoss/sstrans/DIVAHISDB/train_test_all_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=24:00:00
+#SBATCH --time=20:00:00
 #SBATCH --gres=gpu:1
 
 #SBATCH --export=NONE
@@ -20,9 +20,9 @@ module load cudnn
 # Create logs directory 
 mkdir -p logs
 
-# Training configuration for DIVA-HisDB:
-# - model: missformer (requires config file)
-# - dataset: DIVAHISDB (4 classes: background, comment, decoration, main_text)
+# Training configuration for SSTrans on U-DIADS-Bib:
+# - model: sstrans (requires config file)
+# - dataset: UDIADS_BIB (6 classes: background, paratext, decoration, main_text, title, chapter_headings)
 # - base_lr: Initial learning rate
 # - patience: Early stopping patience (stop if no improvement for N epochs)
 # - lr_factor: Factor to reduce learning rate by when plateauing
@@ -32,12 +32,12 @@ mkdir -p logs
 
 conda activate pytorch2.6-py3.12
 
-MANUSCRIPTS=(CSG863) # Train all manuscripts one by one (CB55, CSG18, CSG863)
+MANUSCRIPTS=(CB55 CSG18 CSG863) #CB55 CSG18 CSG863
 
 for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
     echo "=== Training $MANUSCRIPT ==="
     python3 train.py \
-        --model missformer \
+        --model sstrans \
         --dataset DIVAHISDB \
         --divahisdb_root "DivaHisDB_patched" \
         --manuscript ${MANUSCRIPT} \
@@ -48,11 +48,11 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --max_epochs 300 \
         --base_lr 0.0001 \
         --patience 30 \
-        --output_dir "./All_Results_with_No_FocalLoss/sstrans/DIVAHISDB/divahisdb_patch224_missformer_${MANUSCRIPT}"
+        --output_dir "./All_Results_with_FocalLoss_DiceLoss/sstrans/DIVAHISDB/sstrans_patch224_${MANUSCRIPT}"
 
     echo "=== Testing $MANUSCRIPT ==="
     python3 test.py \
-        --model missformer \
+        --model sstrans \
         --dataset DIVAHISDB \
         --divahisdb_root "DivaHisDB_patched" \
         --manuscript ${MANUSCRIPT} \
@@ -60,5 +60,5 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --use_patched_data \
         --is_savenii \
         --num_classes 4 \
-        --output_dir "./All_Results_with_No_FocalLoss/missformer/DIVAHISDB/divahisdb_patch224_missformer_${MANUSCRIPT}"
+        --output_dir "./All_Results_with_FocalLoss_DiceLoss/sstrans/DIVAHISDB/sstrans_patch224_${MANUSCRIPT}"
 done

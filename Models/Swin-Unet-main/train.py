@@ -53,6 +53,19 @@ def get_model(args, config):
         model.load_from(config)
         return model
         
+    elif model_name == 'sstrans':
+        if config is None:
+            raise ValueError("Config is required for SSTrans model")
+        print("Loading SSTrans model...")
+        from networks.sstrans.vision_transformer import SwinUnet as SSTrans_seg
+        model = SSTrans_seg(
+            config, 
+            img_size=args.img_size, 
+            num_classes=args.num_classes
+        ).cuda()
+        model.load_from(config)
+        return model
+        
     elif model_name == 'missformer':
         print("Loading MissFormer model...")
         from networks.MissFormer.MISSFormer import MISSFormer
@@ -62,7 +75,7 @@ def get_model(args, config):
         
     else:
         print(f"ERROR: Unknown model '{args.model}'")
-        print("Supported models: swinunet, missformer")
+        print("Supported models: swinunet, sstrans, missformer")
         sys.exit(1)
 
 
@@ -90,7 +103,8 @@ def setup_datasets(args):
             split="training",
             patch_size=args.patch_size,
             stride=args.patch_stride,
-            use_patched_data=args.use_patched_data
+            use_patched_data=args.use_patched_data,
+            manuscript=getattr(args, 'manuscript', None)
         )
         
         val_dataset = UDiadsBibDataset(
@@ -98,7 +112,8 @@ def setup_datasets(args):
             split="validation",
             patch_size=None,  # Use full images for validation
             stride=None,
-            use_patched_data=args.use_patched_data
+            use_patched_data=args.use_patched_data,
+            manuscript=getattr(args, 'manuscript', None)
         )
         
         return train_dataset, val_dataset
@@ -117,15 +132,17 @@ def setup_datasets(args):
             split="training",
             patch_size=args.patch_size,
             stride=args.patch_stride,
-            use_patched_data=args.use_patched_data
+            use_patched_data=args.use_patched_data,
+            manuscript=getattr(args, 'manuscript', None)
         )
         
         val_dataset = DivaHisDBDataset(
             root_dir=args.divahisdb_root,
             split="validation",
-            patch_size=None,  # Use full images for validation
-            stride=None,
-            use_patched_data=args.use_patched_data
+            patch_size=args.patch_size,  # Use same patch size as training for consistency
+            stride=args.patch_stride,
+            use_patched_data=args.use_patched_data,
+            manuscript=getattr(args, 'manuscript', None)
         )
         
         return train_dataset, val_dataset
@@ -245,7 +262,7 @@ Examples:
     
     # Model selection
     parser.add_argument('--model', type=str, default='swinunet', 
-                       choices=['swinunet', 'missformer'],
+                       choices=['swinunet', 'sstrans', 'missformer'],
                        help='Model architecture to use')
     
     # Required configuration
@@ -262,6 +279,8 @@ Examples:
                        help='Root directory for U-DIADS-Bib dataset')
     parser.add_argument('--divahisdb_root', type=str, default='DIVAHISDB',
                        help='Root directory for DIVAHISDB dataset')
+    parser.add_argument('--manuscript', type=str, default=None,
+                       help='Manuscript name for DIVAHISDB dataset (e.g., CB55, CS18, CS863)')
     parser.add_argument('--use_patched_data', action='store_true',
                        help='Use pre-generated patches instead of extracting patches on-the-fly')
     
@@ -384,11 +403,14 @@ def main():
     if args.model.lower() == 'swinunet':
         print("Loading configuration for SwinUnet...")
         config = get_config(args)
+    elif args.model.lower() == 'sstrans':
+        print("Loading configuration for SSTrans...")
+        config = get_config(args)
     elif args.model.lower() == 'missformer':
         print("MissFormer model - no configuration file needed")
         config = None
     else:
-        print(f"Unknown model: {args.model}. Supported: swinunet, missformer")
+        print(f"Unknown model: {args.model}. Supported: swinunet, sstrans, missformer")
         sys.exit(1)
     
     # Set up datasets

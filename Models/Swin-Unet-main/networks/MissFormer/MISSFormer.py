@@ -355,6 +355,9 @@ class MyDecoderLayer(nn.Module):
 class MISSFormer(nn.Module):
     def __init__(self, num_classes=9, token_mlp_mode="mix_skip", encoder_pretrained=True):
         super().__init__()
+        
+        # Store num_classes as instance attribute
+        self.num_classes = num_classes
     
         reduction_ratios = [8, 4, 2, 1]
         heads = [1, 2, 5, 8]

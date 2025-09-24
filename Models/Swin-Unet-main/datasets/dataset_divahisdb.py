@@ -40,24 +40,33 @@ BIT_TO_CLASS = {
 def decode_bitmask_mask(mask_rgb):
     """Decode HxWx3 uint8 RGB mask to HxW class indices 0..3.
 
-    If multiple bits are set, priority order is: main-text > comment > decoration.
-    Boundary flag is ignored (not used for training labels).
+    Uses vectorized RGB color matching for DivaHisDB masks.
     """
-    # combine channels into integer bitmask
-    r = mask_rgb[:, :, 0].astype(np.uint32)
-    g = mask_rgb[:, :, 1].astype(np.uint32)
-    b = mask_rgb[:, :, 2].astype(np.uint32)
-    bitmask = (r << 16) | (g << 8) | b
-
-    H, W = bitmask.shape
+    H, W = mask_rgb.shape[:2]
     labels = np.zeros((H, W), dtype=np.int64)
-
-    # Apply priority: main text, then comment, then decoration
-    for bit in (BIT_MAIN_TEXT, BIT_COMMENT, BIT_DECORATION):
-        mask = (bitmask & bit) != 0
-        labels[mask] = BIT_TO_CLASS[bit]
-
-    # Background stays 0 where no other bits set
+    
+    # Convert to float for easier comparison
+    mask_float = mask_rgb.astype(np.float32)
+    
+    # Define color ranges with tolerance for slight variations
+    # Comment (green) - high green, low red and blue
+    comment_mask = (mask_float[:,:,1] > 200) & (mask_float[:,:,0] < 100) & (mask_float[:,:,2] < 100)
+    labels[comment_mask] = 1
+    
+    # Decoration (red) - high red, low green and blue  
+    decoration_mask = (mask_float[:,:,0] > 200) & (mask_float[:,:,1] < 100) & (mask_float[:,:,2] < 100)
+    labels[decoration_mask] = 2
+    
+    # Main Text (blue) - high blue, low red and green
+    maintext_mask = (mask_float[:,:,2] > 200) & (mask_float[:,:,0] < 100) & (mask_float[:,:,1] < 100)
+    labels[maintext_mask] = 3
+    
+    # Background (black) - everything else defaults to background (0)
+    # No need to explicitly set background_mask since labels starts as zeros
+    
+    # Ensure all labels are in valid range [0, 3]
+    labels = np.clip(labels, 0, 3)
+    
     return labels
 
 
@@ -67,12 +76,13 @@ def rgb_to_class(mask):
 
 
 class DivaHisDBDataset(Dataset):
-    def __init__(self, root_dir, split, transform=None, patch_size=224, stride=224, use_patched_data=False):
+    def __init__(self, root_dir, split, transform=None, patch_size=224, stride=224, use_patched_data=False, manuscript=None):
         self.root_dir = root_dir
         self.split = split
         self.use_patched_data = use_patched_data
         self.patch_size = patch_size
         self.stride = stride
+        self.manuscript = manuscript
 
         if transform is None:
             # simple identity transforms; caller may pass a stronger transform
@@ -86,8 +96,15 @@ class DivaHisDBDataset(Dataset):
             self.img_paths, self.mask_paths = self._get_original_file_paths()
 
     def _get_patched_file_paths(self):
-        img_dir = os.path.join(self.root_dir, 'Image', self.split)
-        mask_dir = os.path.join(self.root_dir, 'mask', self.split)
+        if self.manuscript:
+            # Manuscript-specific path structure: root/manuscript/Image/split and root/manuscript/mask/split_labels
+            img_dir = os.path.join(self.root_dir, self.manuscript, 'Image', self.split)
+            mask_dir = os.path.join(self.root_dir, self.manuscript, 'mask', f'{self.split}_labels')
+        else:
+            # Original path structure: root/Image/split and root/mask/split
+            img_dir = os.path.join(self.root_dir, 'Image', self.split)
+            mask_dir = os.path.join(self.root_dir, 'mask', self.split)
+            
         if not os.path.exists(img_dir) or not os.path.exists(mask_dir):
             return [], []
         imgs = sorted(glob.glob(os.path.join(img_dir, '*.png')) + glob.glob(os.path.join(img_dir, '*.jpg')))
@@ -96,8 +113,8 @@ class DivaHisDBDataset(Dataset):
         mask_paths = []
         for p in imgs:
             base = os.path.splitext(os.path.basename(p))[0]
-            # expect mask with same base name
-            mp = os.path.join(mask_dir, base + '.png')
+            # Look for mask with "_zones_NA" suffix (DIVA-HisDB patched format)
+            mp = os.path.join(mask_dir, base + '_zones_NA.png')
             if os.path.exists(mp):
                 img_paths.append(p)
                 mask_paths.append(mp)
@@ -139,7 +156,8 @@ class DivaHisDBDataset(Dataset):
             image = image.resize((2016, 1344), Image.BILINEAR)
             mask_class = Image.fromarray(mask_class.astype(np.uint8)).resize((2016, 1344), Image.NEAREST)
             mask_class = np.array(mask_class)
-
-        image, mask_class = self.transform(image, mask_class)
+            # Apply transforms only for non-patched data
+            image, mask_class = self.transform(image, mask_class)
+        
         image = TF.to_tensor(image)
         return {"image": image, "label": torch.from_numpy(mask_class).long(), "case_name": os.path.splitext(os.path.basename(img_path))[0]}

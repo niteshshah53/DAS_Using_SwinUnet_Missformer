@@ -69,7 +69,7 @@ Examples:
     
     # Model selection
     parser.add_argument('--model', type=str, default='swinunet',
-                       choices=['swinunet', 'missformer'],
+                       choices=['swinunet', 'sstrans', 'missformer'],
                        help='Model architecture to test')
     
     # Dataset configuration
@@ -184,13 +184,21 @@ def get_model(args, config):
         model.load_from(config)
         return model
         
+    elif model_name == 'sstrans':
+        if config is None:
+            raise ValueError("Config is required for SSTrans model")
+        from networks.sstrans.vision_transformer import SwinUnet as SSTrans_seg
+        model = SSTrans_seg(config, img_size=args.img_size, num_classes=args.num_classes).cuda()
+        model.load_from(config)
+        return model
+        
     elif model_name == 'missformer':
         from networks.MissFormer.MISSFormer import MISSFormer
         model = MISSFormer(num_classes=args.num_classes).cuda()
         return model
         
     else:
-        print(f"Unknown model: {args.model}. Supported: swinunet, missformer")
+        print(f"Unknown model: {args.model}. Supported: swinunet, sstrans, missformer")
         sys.exit(1)
 
 
@@ -287,10 +295,10 @@ def get_dataset_info(dataset_type):
             rgb_to_class = None
         
         class_colors = [
-            (0, 0, 1),  # 0: Background
-            (0, 0, 2),  # 1: Comment
-            (0, 0, 4),  # 2: Decoration
-            (0, 0, 8),  # 3: Main text
+            (0, 0, 0),      # 0: Background (black)
+            (0, 255, 0),    # 1: Comment (green)
+            (255, 0, 0),    # 2: Decoration (red)
+            (0, 0, 255),    # 3: Main Text (blue)
         ]
         
         class_names = ['Background', 'Comment', 'Decoration', 'Main Text']
@@ -335,8 +343,11 @@ def get_dataset_paths(args):
             patch_dir = f'{args.divahisdb_root}/img/{manuscript_name}/test'
             mask_dir = f'{args.divahisdb_root}/pixel-level-gt/{manuscript_name}/test'
         
-        original_img_dir = f'{args.divahisdb_root}/img/{manuscript_name}/test'
-        original_mask_dir = f'{args.divahisdb_root}/pixel-level-gt/{manuscript_name}/test'
+        # Use the original dataset directory (before patching) for original images
+        # Extract the base directory name from the patched data root
+        base_dir = args.divahisdb_root.replace('_patched', '')
+        original_img_dir = f'{base_dir}/img/{manuscript_name}/test'
+        original_mask_dir = f'{base_dir}/pixel-level-gt/{manuscript_name}/test'
     
     return patch_dir, mask_dir, original_img_dir, original_mask_dir
 
@@ -674,6 +685,15 @@ def inference(args, model, test_save_path=None):
         
         # Compute metrics
         if gt_found:
+            # Ensure ground truth has same dimensions as prediction
+            if gt_class.shape != pred_full.shape:
+                logging.warning(f"Resizing ground truth for metrics computation: {gt_class.shape} -> {pred_full.shape}")
+                gt_class_resized = np.zeros_like(pred_full)
+                min_h = min(gt_class.shape[0], pred_full.shape[0])
+                min_w = min(gt_class.shape[1], pred_full.shape[1])
+                gt_class_resized[:min_h, :min_w] = gt_class[:min_h, :min_w]
+                gt_class = gt_class_resized
+            
             compute_segmentation_metrics(pred_full, gt_class, n_classes, TP, FP, FN)
             num_processed_images += 1
         
@@ -707,12 +727,15 @@ def main():
     if args.model.lower() == 'swinunet':
         config = get_config(args)
         model = get_model(args, config)
+    elif args.model.lower() == 'sstrans':
+        config = get_config(args)
+        model = get_model(args, config)
     elif args.model.lower() == 'missformer':
         # For MissFormer, we don't need config since it trains from scratch
         config = None
         model = get_model(args, config)
     else:
-        print(f"Unknown model: {args.model}. Supported: swinunet, missformer")
+        print(f"Unknown model: {args.model}. Supported: swinunet, sstrans, missformer")
         sys.exit(1)
     
     # Load trained model checkpoint

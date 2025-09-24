@@ -65,12 +65,13 @@ def rgb_to_class(mask):
 import glob
 
 class UDiadsBibDataset(Dataset):
-    def __init__(self, root_dir, split, transform=None, patch_size=448, stride=224, use_patched_data=False):
+    def __init__(self, root_dir, split, transform=None, patch_size=448, stride=224, use_patched_data=False, manuscript=None):
         self.use_patched_data = use_patched_data
         self.root_dir = root_dir
         self.split = split
         self.patch_size = patch_size if not use_patched_data and split == 'training' else None
         self.stride = stride if not use_patched_data and split == 'training' else None
+        self.manuscript = manuscript
         
         # Set up the transform (no lambdas, only top-level functions)
         if transform is None:
@@ -117,16 +118,14 @@ class UDiadsBibDataset(Dataset):
         img_paths = []
         mask_paths = []
         
-        # Pattern for patched dataset structure
-        # U-DIADS-Bib-MS_patched/{manuscript}/Image/{split}/image_name_{patch_id}.png
-        # U-DIADS-Bib-MS_patched/{manuscript}/mask/{split}_labels/image_name_{patch_id}_zones_NA.png
-        
-        # We'll just use the manuscript specified in the root_dir
-        manuscript = os.path.basename(self.root_dir)
-        base_dir = os.path.dirname(self.root_dir)
-        
-        img_dir = f'{base_dir}/{manuscript}/Image/{self.split}'
-        mask_dir = f'{base_dir}/{manuscript}/mask/{self.split}_labels'
+        if self.manuscript:
+            # Manuscript-specific path structure: root/manuscript/Image/split and root/manuscript/mask/split_labels
+            img_dir = os.path.join(self.root_dir, self.manuscript, 'Image', self.split)
+            mask_dir = os.path.join(self.root_dir, self.manuscript, 'mask', f'{self.split}_labels')
+        else:
+            # Original path structure: root/Image/split and root/mask/split
+            img_dir = os.path.join(self.root_dir, 'Image', self.split)
+            mask_dir = os.path.join(self.root_dir, 'mask', self.split)
         
         if multiprocessing.current_process().name == 'MainProcess':
             print(f"Looking for images in: {img_dir}")
