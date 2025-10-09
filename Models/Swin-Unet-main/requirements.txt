@@ -11,3 +11,4 @@ scipy
 h5py
 timm
 einops
+typing_extensions
