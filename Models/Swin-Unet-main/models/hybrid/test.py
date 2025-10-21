@@ -72,7 +72,7 @@ Examples:
     parser.add_argument('--use_efficientnet', action='store_true', default=False,
                        help='Use Enhanced EfficientNet decoder (must match training configuration)')
     parser.add_argument('--use_enhanced', action='store_true', default=False,
-                       help='Use Enhanced Hybrid1 (must match training configuration)')
+                       help='Use Enhanced Hybrid1 with CNN re-embedding (must match training configuration)')
     
     # Dataset configuration
     parser.add_argument('--dataset', type=str, default='UDIADS_BIB',
@@ -179,20 +179,27 @@ def get_model(args, config=None):
     """
     # Determine which hybrid model to use
     if args.model == 'hybrid1':
+        # Check if enhanced version is requested
         use_enhanced = getattr(args, 'use_enhanced', False)
         
         if use_enhanced:
-            print("Loading Enhanced Hybrid1 for testing...")
-            from hybrid1.hybrid_model import create_enhanced_hybrid1
-            model = create_enhanced_hybrid1(
-                num_classes=args.num_classes,
-                img_size=args.img_size
-            ).cuda()
-        else:
+            print("Loading Hybrid1 Enhanced with TransUNet Best Practices for testing...")
             from hybrid1.hybrid_model import create_hybrid_model
             model = create_hybrid_model(
                 num_classes=args.num_classes,
-                img_size=args.img_size
+                img_size=args.img_size,
+                pretrained=False,  # Not needed for testing
+                use_deep_supervision=True,
+                use_multiscale_agg=True,
+                use_smart_skip=False
+            ).cuda()
+        else:
+            print("Loading Hybrid1 Baseline for testing...")
+            from hybrid1.hybrid_model import create_hybrid_model
+            model = create_hybrid_model(
+                num_classes=args.num_classes,
+                img_size=args.img_size,
+                pretrained=False  # Not needed for testing
             ).cuda()
     elif args.model == 'hybrid2':
         # Check which decoder variant to use

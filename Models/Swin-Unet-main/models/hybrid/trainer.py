@@ -234,7 +234,7 @@ def compute_combined_loss(predictions, labels, ce_loss, focal_loss, dice_loss):
         loss_ce = ce_loss(logits, labels)
         loss_focal = focal_loss(logits, labels)
         loss_dice = dice_loss(logits, labels, softmax=True)
-        main_loss = 0.3 * loss_ce + 0.4 * loss_focal + 0.3 * loss_dice
+        main_loss = 0.5 * loss_ce + 0.0 * loss_focal + 0.5 * loss_dice
         
         # Auxiliary losses (decreasing weights for deeper layers)
         # TransUNet practice: [0.4, 0.3, 0.2] for 3 aux outputs
@@ -257,7 +257,7 @@ def compute_combined_loss(predictions, labels, ce_loss, focal_loss, dice_loss):
         loss_dice = dice_loss(predictions, labels, softmax=True)
         
         # Balanced combination - same for train and val
-        return 0.3 * loss_ce + 0.4 * loss_focal + 0.3 * loss_dice
+        return 0.5 * loss_ce + 0.0 * loss_focal + 0.5 * loss_dice
 
 
 def create_optimizer_and_scheduler(model, learning_rate, args=None):

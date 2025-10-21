@@ -46,22 +46,26 @@ def get_model(args, config=None):
     """
     # Determine which hybrid model to use
     if args.model == 'hybrid1':
+        # Check if enhanced version is requested
         use_enhanced = getattr(args, 'use_enhanced', False)
         
         if use_enhanced:
             print("=" * 80)
-            print("🚀 Loading Enhanced Hybrid1: TransUNet Best Practices")
+            print("🚀 Loading Hybrid1 Enhanced: EfficientNet-B4 + Swin-Unet with TransUNet Best Practices")
             print("=" * 80)
-            from hybrid1.hybrid_model import create_enhanced_hybrid1
-            model = create_enhanced_hybrid1(
+            from hybrid1.hybrid_model import create_hybrid_model
+            model = create_hybrid_model(
                 num_classes=args.num_classes,
                 img_size=args.img_size,
-                pretrained=True
+                pretrained=True,
+                use_deep_supervision=True,
+                use_multiscale_agg=True,
+                use_smart_skip=False
             )
         else:
-            print("Loading Hybrid1: EfficientNet-Swin model...")
-            from hybrid1.hybrid_model import HybridEfficientNetB4SwinDecoder
-            model = HybridEfficientNetB4SwinDecoder(
+            print("Loading Hybrid1 Baseline: EfficientNet-B4 + Swin-Unet...")
+            from hybrid1.hybrid_model import create_hybrid_model
+            model = create_hybrid_model(
                 num_classes=args.num_classes,
                 img_size=args.img_size,
                 pretrained=True
@@ -229,7 +233,7 @@ def parse_arguments():
     parser.add_argument('--use_efficientnet', action='store_true', default=False,
                        help='Use Enhanced EfficientNet decoder (Pure CNN + TransUNet improvements, Expected IoU: 0.60-0.65)')
     parser.add_argument('--use_enhanced', action='store_true', default=False,
-                       help='Use Enhanced Hybrid1 (Deep Supervision + Multi-Scale Aggregation, Expected IoU: 0.50-0.55)')
+                       help='Use Enhanced Hybrid1 with TransUNet best practices (Deep Supervision + Multi-scale Aggregation)')
     parser.add_argument('--img_size', type=int, default=224, help='Input image size')
     parser.add_argument('--num_classes', type=int, default=5, help='Number of classes')
     
@@ -311,8 +315,9 @@ def main():
     print("Learning rate: {}".format(args.base_lr))
     print()
     
-    # Run training
+    # Run training with SwinUnet approach
     result = trainer_hybrid(args, model, args.output_dir, train_dataset, val_dataset)
+    
     print("\n=== TRAINING COMPLETED SUCCESSFULLY ===")
     print(result)
 

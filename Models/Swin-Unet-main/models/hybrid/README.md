@@ -4,10 +4,12 @@ This directory contains two hybrid models that combine different encoder-decoder
 
 ## Models
 
-### Hybrid1: EfficientNet-Swin
-- **Encoder**: EfficientNet-B4 (CNN-based)
-- **Decoder**: SwinUnet (Transformer-based)
-- **Architecture**: CNN Encoder + Transformer Decoder
+### Hybrid1: EfficientNet-Swin (Reference-Aligned Baseline_v2 + Enhanced)
+- **Encoder**: EfficientNet-B4 (CNN-based, raw features)
+- **Bottleneck**: Conv1×1 + LayerNorm (C4 only: 448→768)
+- **Decoder**: SwinUnet (Transformer-based, post-concat adaptation)
+- **Architecture**: CNN Encoder + Transformer Decoder (100% Reference Compliant)
+- **Enhanced Version**: CNN re-embedding with FC layers for better CNN-transformer alignment
 
 ### Hybrid2: Swin-EfficientNet Enhanced
 - **Encoder**: SwinUnet (Transformer-based)
@@ -40,7 +42,7 @@ hybrid/
 
 ### Training
 
-#### Hybrid1 (EfficientNet-Swin)
+#### Hybrid1 Baseline (EfficientNet-Swin)
 ```bash
 python3 train.py \
     --model hybrid1 \
@@ -53,6 +55,39 @@ python3 train.py \
     --base_lr 0.0002 \
     --patience 30 \
     --output_dir "./results/hybrid1_latin2"
+```
+
+#### Hybrid1 Enhanced (with Full CNN Re-embedding)
+```bash
+python3 train.py \
+    --model hybrid1 \
+    --use_enhanced \
+    --dataset UDIADS_BIB \
+    --udiadsbib_root "../../U-DIADS-Bib-MS_patched" \
+    --manuscript Latin2 \
+    --use_patched_data \
+    --batch_size 16 \
+    --max_epochs 300 \
+    --base_lr 0.0002 \
+    --patience 30 \
+    --output_dir "./results/hybrid1_enhanced_latin2"
+```
+
+#### Hybrid1 Enhanced with Progressive Unfreezing
+```bash
+python3 train.py \
+    --model hybrid1 \
+    --use_enhanced \
+    --use_progressive_unfreezing \
+    --dataset UDIADS_BIB \
+    --udiadsbib_root "../../U-DIADS-Bib-MS_patched" \
+    --manuscript Latin2 \
+    --use_patched_data \
+    --batch_size 16 \
+    --max_epochs 200 \
+    --base_lr 0.0002 \
+    --patience 30 \
+    --output_dir "./results/hybrid1_progressive_latin2"
 ```
 
 #### Hybrid2 (Swin-EfficientNet)
@@ -73,7 +108,7 @@ python3 train.py \
 
 ### Testing
 
-#### Hybrid1
+#### Hybrid1 Baseline
 ```bash
 python3 test.py \
     --model hybrid1 \
@@ -83,6 +118,19 @@ python3 test.py \
     --use_patched_data \
     --is_savenii \
     --output_dir "./results/hybrid1_latin2"
+```
+
+#### Hybrid1 Enhanced (with Full CNN Re-embedding)
+```bash
+python3 test.py \
+    --model hybrid1 \
+    --use_enhanced \
+    --dataset UDIADS_BIB \
+    --udiadsbib_root "../../U-DIADS-Bib-MS_patched" \
+    --manuscript Latin2 \
+    --use_patched_data \
+    --is_savenii \
+    --output_dir "./results/hybrid1_enhanced_latin2"
 ```
 
 #### Hybrid2
@@ -112,6 +160,10 @@ python3 test.py \
 - `--patience`: Early stopping patience
 - `--output_dir`: Directory to save results
 
+### Hybrid1 Specific Arguments
+- `--use_enhanced`: Use Enhanced Hybrid1 with full CNN re-embedding (FC layers for better CNN-transformer alignment)
+- `--use_progressive_unfreezing`: Use progressive unfreezing training strategy (Hybrid1 Enhanced only)
+
 ### Hybrid2 Specific Arguments
 - `--efficientnet_variant`: EfficientNet variant for decoder (`b0`, `b4`, `b5`)
 
@@ -127,6 +179,8 @@ python3 test.py \
 - **Scheduler**: CosineAnnealingWarmRestarts
 - **Early Stopping**: Yes (patience=50 epochs)
 - **Class Weights**: Computed from pixel frequency
+- **Enhanced Version**: Full CNN re-embedding with FC layers (32→96, 56→192, 160→384, 448→768 channels)
+- **Progressive Unfreezing**: 3-stage training (Decoder-only → Full model → Fine-tuning)
 
 ### Hybrid2 (Swin-EfficientNet Enhanced)
 - **Loss Function**: 0.3 * CE + 0.4 * Focal + 0.3 * Dice (with class weights)
@@ -176,16 +230,16 @@ python3 test.py --model hybrid2 --efficientnet_variant b4 --use_tta --manuscript
 
 ## Model Comparison
 
-| Aspect | Hybrid1 (EfficientNet-Swin) | Hybrid2 (Swin-EfficientNet Enhanced) |
-|--------|------------------------------|---------------------------------------|
-| Encoder | EfficientNet-B4 (CNN) | SwinUnet (Transformer) |
-| Decoder | SwinUnet (Transformer) | Enhanced EfficientNet-style (CNN) |
-| Parameters | ~50M | ~45M |
-| Memory Usage | Moderate | Moderate |
-| Training Speed | Fast | Moderate |
-| Inference Speed | Fast | Fast |
-| Special Features | Standard architecture | CBAM Attention, Smart Skip Connections |
-| Best For | Quick training, good performance | Enhanced feature extraction, attention mechanisms |
+| Aspect | Hybrid1 Baseline | Hybrid1 Enhanced | Hybrid1 Progressive | Hybrid2 (Swin-EfficientNet Enhanced) |
+|--------|------------------|------------------|---------------------|---------------------------------------|
+| Encoder | EfficientNet-B4 (CNN) | EfficientNet-B4 + Re-embedding | EfficientNet-B4 + Re-embedding | SwinUnet (Transformer) |
+| Decoder | SwinUnet (Transformer) | SwinUnet (Transformer) | SwinUnet (Transformer) | Enhanced EfficientNet-style (CNN) |
+| Parameters | ~38M | ~38M (+0.5%) | ~38M (+0.5%) | ~45M |
+| Memory Usage | Moderate | Moderate | Moderate | Moderate |
+| Training Speed | Fast | Fast | Moderate (3 stages) | Moderate |
+| Inference Speed | Fast | Fast | Fast | Fast |
+| Special Features | Standard architecture | Full CNN re-embedding with FC layers | Progressive unfreezing + CNN re-embedding | CBAM Attention, Smart Skip Connections |
+| Best For | Quick training, good performance | Better CNN-transformer alignment | Maximum performance with stable training | Enhanced feature extraction, attention mechanisms |
 
 ## Recent Updates & Improvements
 
@@ -195,6 +249,13 @@ python3 test.py --model hybrid2 --efficientnet_variant b4 --use_tta --manuscript
 - **Optimizer**: AdamW with increased weight_decay=0.05 for better regularization
 - **Scheduler**: CosineAnnealingWarmRestarts for improved transformer convergence
 - **Early Stopping**: Increased patience to 50 epochs for better convergence
+
+### Hybrid1 Progressive Unfreezing (Latest)
+- **3-Stage Training**: Decoder-only → Full model → Fine-tuning
+- **Stage 1**: Freeze encoder, train decoder (50 epochs, LR=0.0002)
+- **Stage 2**: Unfreeze encoder, train entire model (100 epochs, LR=0.0001)
+- **Stage 3**: Fine-tune with very low LR (50 epochs, LR=0.00002)
+- **Expected Improvement**: +53-81% over baseline (IoU 0.36 → 0.55-0.65)
 
 ### Hybrid2 Enhancements
 - **CBAM Attention**: Channel and spatial attention mechanisms for better feature focus

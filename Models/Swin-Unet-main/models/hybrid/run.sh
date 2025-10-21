@@ -52,7 +52,7 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --patience 50 \
         --output_dir "./Results_Optimized_Hyperparameters/hybrid1/UDIADS_BIB_MS/udiadsbib_hybrid1_${MANUSCRIPT}"
 
-    echo "=== Testing Hybrid1-Enhanced EfficientNet $MANUSCRIPT ==="
+    echo "=== Testing Hybrid1-Enhanced EfficientNet $MANUSCRIPT with TTA ==="
     python3 test.py \
         --model hybrid1 \
         --use_efficientnet \
@@ -61,6 +61,7 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --manuscript ${MANUSCRIPT} \
         --use_patched_data \
         --is_savenii \
+        --use_tta \
         --output_dir "./Results_Optimized_Hyperparameters/hybrid1/UDIADS_BIB_MS/udiadsbib_hybrid1_${MANUSCRIPT}"
 done
 
