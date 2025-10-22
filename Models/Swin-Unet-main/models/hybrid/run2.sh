@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=hybrid_train_test
-#SBATCH --output=./All_Results_with_No_FocalLoss/hybrid2/UDIADS_BIB_FS/train_test_all_%j.out
-#SBATCH --error=./All_Results_with_No_FocalLoss/hybrid2/UDIADS_BIB_FS/train_test_all_%j.out
+#SBATCH --output=./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_FS/train_test_optuna_%j.out
+#SBATCH --error=./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_FS/train_test_optuna_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -19,9 +19,10 @@ module load cudnn
 
 # Create logs directory 
 mkdir -p ../../logs
+mkdir -p ./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_FS
 
 # Training configuration for Hybrid2:
-# - model: hybrid2 (Swin-EfficientNet hybrid)
+# - model: hybrid1 (Swin-EfficientNet hybrid)
 # - dataset: UDIADS_BIB (5 classes for Syr341FS, 6 classes for others)
 # - efficientnet_variant: b4 (balanced performance)
 # - base_lr: Initial learning rate
@@ -39,27 +40,27 @@ MANUSCRIPTS=(Latin2FS Latin14396FS Latin16746FS Syr341FS)
 for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
     echo "=== Training Hybrid2 $MANUSCRIPT ==="
     python3 train.py \
-        --model hybrid2 \
-        --efficientnet_variant b4 \
+        --model hybrid1 \
+        --use_enhanced \
         --dataset UDIADS_BIB \
         --udiadsbib_root "../../U-DIADS-Bib-FS_patched" \
         --manuscript ${MANUSCRIPT} \
         --use_patched_data \
-        --batch_size 16 \
+        --batch_size 4 \
         --max_epochs 300 \
         --base_lr 0.0002 \
         --patience 50 \
-        --output_dir "./All_Results_with_No_FocalLoss/hybrid2/UDIADS_BIB_FS/udiadsbib_patch224_hybrid2_${MANUSCRIPT}"
+        --output_dir "./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_FS/udiadsbib_Hybrid1_enhanced_${MANUSCRIPT}"
 
     echo "=== Testing Hybrid2 $MANUSCRIPT ==="
     python3 test.py \
-        --model hybrid2 \
-        --efficientnet_variant b4 \
+        --model hybrid1 \
+        --use_enhanced \
         --dataset UDIADS_BIB \
         --udiadsbib_root "../../U-DIADS-Bib-FS_patched" \
         --manuscript ${MANUSCRIPT} \
         --use_patched_data \
         --is_savenii \
         --use_tta \
-        --output_dir "./All_Results_with_No_FocalLoss/hybrid2/UDIADS_BIB_FS/udiadsbib_patch224_hybrid2_${MANUSCRIPT}"
+        --output_dir "./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_FS/udiadsbib_Hybrid1_enhanced_${MANUSCRIPT}"
 done

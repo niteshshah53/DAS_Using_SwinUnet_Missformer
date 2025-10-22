@@ -48,23 +48,32 @@ def set_seed(seed):
     cudnn.benchmark = False
 
 
-def get_model(model_type, num_classes, img_size):
+def get_model(model_type, num_classes, img_size, use_enhanced=False):
     """Create and initialize the Hybrid model."""
     if model_type == 'hybrid1':
-        print(f"[Trial] Loading Hybrid1: EfficientNet-Swin model...")
-        from hybrid1.hybrid_model import HybridEfficientNetB4SwinDecoder
-        model = HybridEfficientNetB4SwinDecoder(
-            num_classes=num_classes,
-            img_size=img_size,
-            pretrained=True
-        )
+        print(f"[Trial] Loading Hybrid1: Streaming EfficientNet-Swin model...")
+        from hybrid1.hybrid_model import create_hybrid_model, create_enhanced_hybrid1
+        
+        if use_enhanced:
+            print(f"[Trial] Using Enhanced Hybrid1 with Deep Supervision + Multi-scale Aggregation")
+            model = create_enhanced_hybrid1(
+                num_classes=num_classes,
+                img_size=img_size,
+                pretrained=True
+            )
+        else:
+            print(f"[Trial] Using Basic Hybrid1")
+            model = create_hybrid_model(
+                num_classes=num_classes,
+                img_size=img_size,
+                pretrained=True
+            )
     elif model_type == 'hybrid2':
         print(f"[Trial] Loading Hybrid2: Swin-EfficientNet model...")
-        from hybrid2.hybrid_model import create_hybrid2_model
-        model = create_hybrid2_model(
+        from hybrid2.hybrid_model_transunet import create_hybrid2_transunet
+        model = create_hybrid2_transunet(
             num_classes=num_classes,
-            img_size=img_size,
-            efficientnet_variant='b4'
+            img_size=img_size
         )
     else:
         raise ValueError(f"Unknown model: {model_type}")
@@ -215,7 +224,7 @@ def objective(trial, base_args):
     
     # Create model
     try:
-        model = get_model(args.model, args.num_classes, args.img_size)
+        model = get_model(args.model, args.num_classes, args.img_size, args.use_enhanced)
     except Exception as e:
         print(f"[Trial {trial.number}] Model creation failed: {e}")
         return float('inf')
@@ -266,6 +275,10 @@ def parse_arguments():
                        help='Root directory for DIVAHISDB dataset')
     parser.add_argument('--use_patched_data', action='store_true', default=False,
                        help='Use pre-generated patches')
+    
+    # Model configuration
+    parser.add_argument('--use_enhanced', action='store_true', default=False,
+                       help='Use Enhanced Hybrid1 with Deep Supervision + Multi-scale Aggregation')
     
     # Optuna configuration
     parser.add_argument('--n_trials', type=int, default=50,

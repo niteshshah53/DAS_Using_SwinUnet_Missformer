@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from .efficientnet_encoder import EfficientNetEncoderWithAdapters
+from .efficientnet_encoder import EfficientNetStreamingEncoder
 from .swin_decoder import SwinDecoder
 
 
@@ -11,16 +11,18 @@ from .swin_decoder import SwinDecoder
 
 class HybridEfficientNetB4SwinDecoder(nn.Module):
     """
-    Hybrid model that combines EfficientNet-B4 encoder with Swin-Unet decoder.
+    Hybrid model that combines Streaming EfficientNet-B4 encoder with Swin-Unet decoder.
     
-    This model replaces the Swin-Unet encoder with an EfficientNet-B4 CNN encoder
-    while keeping the Swin-Unet decoder intact for segmentation.
+    This model uses a streaming EfficientNet-B4 encoder that processes each stage individually,
+    applying channel adaptation and tokenization immediately after each stage. This makes skip
+    connections immediately ready for the decoder, providing better memory efficiency and cleaner architecture.
     
     Pipeline:
-      1. EfficientNet-B4 backbone extracts multi-scale features (strides 4, 8, 16, 32)
-      2. Channel adapters map CNN channels to Swin decoder expected dimensions [96, 192, 384, 768]
-      3. Features are converted to token sequences and fed into Swin-Unet decoder
-      4. Swin decoder performs upsampling with skip connections to produce segmentation masks
+      1. Stage 1: Extract C1 → Channel Adaptation → Tokenization → Skip Ready
+      2. Stage 2: Extract C2 → Channel Adaptation → Tokenization → Skip Ready  
+      3. Stage 3: Extract C3 → Channel Adaptation → Tokenization → Skip Ready
+      4. Stage 4: Extract C4 → Channel Adaptation → Tokenization → Bottleneck Ready
+      5. Swin decoder performs upsampling with ready skip connections to produce segmentation masks
     
     Args:
         num_classes: Number of segmentation classes (4, 5, or 6, default: 6)
@@ -43,10 +45,10 @@ class HybridEfficientNetB4SwinDecoder(nn.Module):
         self.use_multiscale_agg = use_multiscale_agg
         self.use_smart_skip = use_smart_skip
         
-        # 1. EfficientNet-B4 encoder with channel adapters
+        # 1. Streaming EfficientNet-B4 encoder with immediate channel adaptation
         # Target dims follow Swin-Tiny progression used by the decoder
         target_dims = [96, 192, 384, 768]
-        self.encoder = EfficientNetEncoderWithAdapters(
+        self.encoder = EfficientNetStreamingEncoder(
             target_dims=target_dims, 
             pretrained=pretrained
         )
@@ -62,7 +64,7 @@ class HybridEfficientNetB4SwinDecoder(nn.Module):
         )
         
         print(f"Hybrid1 model initialized:")
-        print(f"  - Encoder: EfficientNet-B4 with skip/bottleneck adapters")
+        print(f"  - Encoder: Streaming EfficientNet-B4 (immediate adaptation + tokenization)")
         print(f"  - Decoder: Swin-Unet with BOTTLENECK LAYER (2 SwinBlocks)")
         print(f"  - Segmentation Head: Conv3x3 + ReLU + Conv1x1 (REFERENCE COMPLIANT)")
         if use_deep_supervision:
@@ -95,7 +97,7 @@ class HybridEfficientNetB4SwinDecoder(nn.Module):
     
     def forward(self, x: torch.Tensor):
         """
-        Forward pass through the hybrid model.
+        Forward pass through the hybrid model with streaming encoder.
         
         Args:
             x: Input tensor of shape (B, 3, H, W)
@@ -106,23 +108,23 @@ class HybridEfficientNetB4SwinDecoder(nn.Module):
             Else:
                 main_logits (B, num_classes, H, W)
         """
-        # Get 4 feature levels from EfficientNet encoder with adapters
-        # feats: [P2 (stride 4), P3 (stride 8), P4 (stride 16), P5 (stride 32)]
-        feats = self.encoder(x)
-        assert len(feats) == 4, "Encoder did not return 4 feature levels"
+        # Get tokenized features directly from streaming encoder
+        # tokens: [C1_tokens, C2_tokens, C3_tokens, C4_tokens] - already adapted and tokenized
+        tokens = self.encoder(x)
+        assert len(tokens) == 4, "Encoder did not return 4 tokenized feature levels"
         
-        # Prepare tokens for decoder: bottom (P5) as current x, others as skip list
-        p2, p3, p4, p5 = feats  # strides 4, 8, 16, 32
+        # Extract tokens for decoder: bottom (C4) as current x, others as skip list
+        c1_tokens, c2_tokens, c3_tokens, c4_tokens = tokens  # strides 4, 8, 16, 32
         
-        # Convert to token sequences (B, L, C)
-        target_dims = self.encoder.get_target_dims()
-        x_tokens = self._to_tokens(p5, out_dim=target_dims[3])  # (B, 7*7, 768) for 224 input
+        # Current tokens for bottleneck processing (deepest features)
+        x_tokens = c4_tokens  # (B, 7*7, 768) for 224 input
         
+        # Skip connection tokens (already tokenized and ready)
         x_downsample = [
-            self._to_tokens(p2, out_dim=target_dims[0]),  # (B, 56*56, 96)
-            self._to_tokens(p3, out_dim=target_dims[1]),  # (B, 28*28, 192)
-            self._to_tokens(p4, out_dim=target_dims[2]),  # (B, 14*14, 384)
-            self._to_tokens(p5, out_dim=target_dims[3])   # (B, 7*7, 768)
+            c1_tokens,  # (B, 56*56, 96)
+            c2_tokens,  # (B, 28*28, 192)
+            c3_tokens,  # (B, 14*14, 384)
+            c4_tokens   # (B, 7*7, 768)
         ]
         
         # ✅ BOTTLENECK PROCESSING: Process deepest features through 2 SwinBlocks
@@ -152,11 +154,12 @@ class HybridEfficientNetB4SwinDecoder(nn.Module):
         """Get model information for debugging and analysis."""
         return {
             'model_type': 'HybridEfficientNetB4SwinDecoder',
-            'encoder': 'EfficientNet-B4',
+            'encoder': 'Streaming EfficientNet-B4',
             'decoder': 'Swin-Unet',
             'num_classes': self.num_classes,
             'img_size': self.img_size,
             'target_dims': self.encoder.get_target_dims(),
+            'source_channels': self.encoder.get_source_channels(),
             'total_params': sum(p.numel() for p in self.parameters()),
             'trainable_params': sum(p.numel() for p in self.parameters() if p.requires_grad)
         }
@@ -170,7 +173,7 @@ def create_hybrid_model(num_classes: int = 6, img_size: int = 224, pretrained: b
                         use_deep_supervision: bool = False, use_multiscale_agg: bool = False,
                         use_smart_skip: bool = False) -> HybridEfficientNetB4SwinDecoder:
     """
-    Factory function to create a hybrid EfficientNet-Swin model.
+    Factory function to create a hybrid EfficientNet-Swin model with streaming encoder.
     
     Args:
         num_classes: Number of segmentation classes (4, 5, or 6)
@@ -181,7 +184,7 @@ def create_hybrid_model(num_classes: int = 6, img_size: int = 224, pretrained: b
         use_smart_skip: Enable smart skip connections (attention-based fusion)
         
     Returns:
-        Initialized hybrid model
+        Initialized hybrid model with streaming encoder
     """
     model = HybridEfficientNetB4SwinDecoder(
         num_classes=num_classes,
@@ -198,7 +201,7 @@ def create_hybrid_model(num_classes: int = 6, img_size: int = 224, pretrained: b
 def create_enhanced_hybrid1(num_classes: int = 6, img_size: int = 224, pretrained: bool = True,
                            use_smart_skip: bool = False) -> HybridEfficientNetB4SwinDecoder:
     """
-    Create Enhanced Hybrid1 with all TransUNet best practices.
+    Create Enhanced Hybrid1 with streaming encoder and all TransUNet best practices.
     
     Expected Performance: IoU 0.50-0.55 (vs baseline 0.40, +25-38%)
     
@@ -209,7 +212,7 @@ def create_enhanced_hybrid1(num_classes: int = 6, img_size: int = 224, pretraine
         use_smart_skip: Enable smart skip connections (optional enhancement)
     
     Returns:
-        Enhanced Hybrid1 model with deep supervision and multi-scale aggregation
+        Enhanced Hybrid1 model with streaming encoder, deep supervision and multi-scale aggregation
     """
     return create_hybrid_model(
         num_classes=num_classes,

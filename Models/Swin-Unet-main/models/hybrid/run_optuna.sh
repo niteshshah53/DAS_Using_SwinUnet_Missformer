@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=optuna_hybrid_tune
-#SBATCH --output=./optuna_results/hybrid2/optuna_tune_%j.out
-#SBATCH --error=./optuna_results/hybrid2/optuna_tune_%j.out
+#SBATCH --output=./optuna_results/hybrid1/optuna_tune_%j.out
+#SBATCH --error=./optuna_results/hybrid1/optuna_tune_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -44,6 +44,7 @@ export CUDA_VISIBLE_DEVICES=0
 # ============================================================================
 MODEL="hybrid1"                    # hybrid1 or hybrid2
 DATASET="UDIADS_BIB"              # UDIADS_BIB or DIVAHISDB
+USE_ENHANCED=true                  # Use Enhanced Hybrid1 (Deep Supervision + Multi-scale Aggregation)
 N_TRIALS=50                        # Number of Optuna trials (start with 20-30 for testing)
 MAX_EPOCHS_PER_TRIAL=50           # Max epochs per trial (reduced for speed)
 PATIENCE=15                        # Early stopping patience per trial
@@ -57,7 +58,7 @@ DIVAHISDB_ROOT="../../DivaHisDB_patched"
 # ============================================================================
 
 # For UDIADS_BIB: Latin2, Latin14396, Latin16746, Syr341
-MANUSCRIPTS=(Syr341 Latin2 Latin14396 Latin16746)
+MANUSCRIPTS=(Latin2 Latin14396 Latin16746 Syr341)
 
 for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
     echo ""
@@ -67,7 +68,7 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
     echo ""
     
     # Output directory for this manuscript
-    OUTPUT_DIR="./optuna_results/hybrid2/${DATASET}/${MANUSCRIPT}"
+    OUTPUT_DIR="./optuna_results/${MODEL}/${DATASET}/${MANUSCRIPT}"
     
     echo "=========================================="
     echo "Starting Optuna Hyperparameter Tuning"
@@ -75,6 +76,7 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
     echo "Model: ${MODEL}"
     echo "Dataset: ${DATASET}"
     echo "Manuscript: ${MANUSCRIPT}"
+    echo "Enhanced Mode: ${USE_ENHANCED}"
     echo "Number of trials: ${N_TRIALS}"
     echo "Max epochs per trial: ${MAX_EPOCHS_PER_TRIAL}"
     echo "Early stopping patience: ${PATIENCE}"
@@ -104,6 +106,7 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --udiadsbib_root ${UDIADSBIB_ROOT} \
         --divahisdb_root ${DIVAHISDB_ROOT} \
         --use_patched_data \
+        --use_enhanced \
         --n_trials ${N_TRIALS} \
         --optuna_max_epochs ${MAX_EPOCHS_PER_TRIAL} \
         --optuna_patience ${PATIENCE} \
@@ -138,12 +141,7 @@ done
 
 echo ""
 echo "========================================================================"
-echo "ALL MANUSCRIPTS COMPLETED!"
+echo "ALL MANUSCRIPTS COMPLETED FOR HYBRID1!"
 echo "========================================================================"
 echo "Tuned manuscripts: ${MANUSCRIPTS[@]}"
-echo ""
-echo "Results locations:"
-for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
-    echo "  - ${MANUSCRIPT}: ./optuna_results/hybrid2/${DATASET}/${MANUSCRIPT}/"
-done
 echo "========================================================================"

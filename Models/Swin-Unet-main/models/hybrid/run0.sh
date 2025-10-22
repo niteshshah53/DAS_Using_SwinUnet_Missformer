@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=Hybrid1_enhanced_train_test
-#SBATCH --output=./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_MS/train_test_enhanced_%j.out
-#SBATCH --error=./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_MS/train_test_enhanced_%j.out
+#SBATCH --output=./Results_Optimized_Hyperparameters/v3/hybrid1/UDIADS_BIB_MS/train_test_enhanced_%j.out
+#SBATCH --error=./Results_Optimized_Hyperparameters/v3/hybrid1/UDIADS_BIB_MS/train_test_enhanced_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -19,7 +19,7 @@ module load cudnn
 
 # Create logs directory 
 mkdir -p ../../logs
-mkdir -p ./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_MS
+mkdir -p ./Results_Optimized_Hyperparameters/v3/hybrid1/UDIADS_BIB_MS
 
 conda activate base
 
@@ -43,7 +43,7 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --max_epochs 300 \
         --base_lr 0.0002 \
         --patience 50 \
-        --output_dir "./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_MS/udiadsbib_Hybrid1_enhanced_${MANUSCRIPT}"
+        --output_dir "./Results_Optimized_Hyperparameters/v3/hybrid1/UDIADS_BIB_MS/udiadsbib_Hybrid1_enhanced_${MANUSCRIPT}"
 
     echo "=== Testing hybrid1 Model $MANUSCRIPT ==="
     python3 test.py \
@@ -55,14 +55,14 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --use_patched_data \
         --is_savenii \
         --use_tta \
-        --output_dir "./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_MS/udiadsbib_Hybrid1_enhanced_${MANUSCRIPT}"
+        --output_dir "./Results_Optimized_Hyperparameters/v3/hybrid1/UDIADS_BIB_MS/udiadsbib_Hybrid1_enhanced_${MANUSCRIPT}"
 done
 
 echo ""
 echo "========================================================================"
 echo "ALL MANUSCRIPTS COMPLETED - HYBRID1 Model!"
 echo "========================================================================"
-echo "Results saved in: ./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_MS/"
+echo "Results saved in: ./Results_Optimized_Hyperparameters/v3/hybrid1/UDIADS_BIB_MS/"
 echo ""
 echo "Model: hybrid1 Model (EfficientNet-B4 + Swin-Unet with TransUNet Best Practices)"
 echo "Architecture: EfficientNet-B4 Encoder → Swin-Unet Decoder"
