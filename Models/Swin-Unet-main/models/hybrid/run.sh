@@ -1,12 +1,13 @@
 #!/bin/bash -l
-#SBATCH --job-name=hybrid1_optuna_train_test
-#SBATCH --output=./Results_Optimized_Hyperparameters/hybrid1/UDIADS_BIB_MS/train_test_optuna_%j.out
-#SBATCH --error=./Results_Optimized_Hyperparameters/hybrid1/UDIADS_BIB_MS/train_test_optuna_%j.out
+#SBATCH --job-name=Hybrid1_enhanced_train_test
+#SBATCH --output=./Results_Optimized_Hyperparameters/v3/hybrid13/UDIADS_BIB_MS/train_test_enhanced_%j.out
+#SBATCH --error=./Results_Optimized_Hyperparameters/v3/hybrid13/UDIADS_BIB_MS/train_test_enhanced_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --time=24:00:00
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:rtx3080:1
+#SBATCH --partition=rtx3080
 
 #SBATCH --export=NONE
 unset SLURM_EXPORT_ENV
@@ -19,14 +20,7 @@ module load cudnn
 
 # Create logs directory 
 mkdir -p ../../logs
-mkdir -p ./Results_Optimized_Hyperparameters/hybrid1/UDIADS_BIB_MS
-
-# Training configuration for Hybrid1 with OPTUNA-OPTIMIZED HYPERPARAMETERS:
-# - model: hybrid1 (EfficientNet-Swin Encoder + Swin-Unet Decoder)
-# - dataset: UDIADS_BIB (5 classes for Syr341, 6 classes for others)
-# - base_lr: 0.0002 (Optuna Trial 31, Val Loss: 0.228)
-# - batch_size: 8 (Optuna-optimized)
-# - patience: 50 (Optuna-optimized)
+mkdir -p ./Results_Optimized_Hyperparameters/v3/hybrid13/UDIADS_BIB_MS
 
 conda activate base
 
@@ -38,51 +32,45 @@ export CUDA_VISIBLE_DEVICES=0
 MANUSCRIPTS=(Latin2 Latin14396 Latin16746 Syr341)
 
 for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
-    echo "=== Training Hybrid1-Enhanced EfficientNet $MANUSCRIPT ==="
+    echo "=== Training hybrid1 Model $MANUSCRIPT ==="
     python3 train.py \
         --model hybrid1 \
-        --use_efficientnet \
+        --use_enhanced \
         --dataset UDIADS_BIB \
         --udiadsbib_root "../../U-DIADS-Bib-MS_patched" \
         --manuscript ${MANUSCRIPT} \
         --use_patched_data \
-        --batch_size 8 \
+        --batch_size 4 \
         --max_epochs 300 \
-        --base_lr 0.0002 \
+        --base_lr 0.0001 \
         --patience 50 \
-        --output_dir "./Results_Optimized_Hyperparameters/hybrid1/UDIADS_BIB_MS/udiadsbib_hybrid1_${MANUSCRIPT}"
+        --scheduler_type CosineAnnealingWarmRestarts \
+        --output_dir "./Results_Optimized_Hyperparameters/v3/hybrid13/UDIADS_BIB_MS/udiadsbib_Hybrid1_enhanced_${MANUSCRIPT}"
 
-    echo "=== Testing Hybrid1-Enhanced EfficientNet $MANUSCRIPT with TTA ==="
+    echo "=== Testing hybrid1 Model $MANUSCRIPT ==="
     python3 test.py \
         --model hybrid1 \
-        --use_efficientnet \
+        --use_enhanced \
         --dataset UDIADS_BIB \
         --udiadsbib_root "../../U-DIADS-Bib-MS_patched" \
         --manuscript ${MANUSCRIPT} \
         --use_patched_data \
         --is_savenii \
         --use_tta \
-        --output_dir "./Results_Optimized_Hyperparameters/hybrid1/UDIADS_BIB_MS/udiadsbib_hybrid1_${MANUSCRIPT}"
+        --output_dir "./Results_Optimized_Hyperparameters/v3/hybrid13/UDIADS_BIB_MS/udiadsbib_Hybrid1_enhanced_${MANUSCRIPT}"
 done
 
 echo ""
 echo "========================================================================"
-echo "ALL MANUSCRIPTS COMPLETED - ENHANCED EFFICIENTNET DECODER!"
+echo "ALL MANUSCRIPTS COMPLETED - HYBRID1 Model!"
 echo "========================================================================"
-echo "Results saved in: ./Results_Optimized_Hyperparameters/hybrid1/UDIADS_BIB_MS/"
+echo "Results saved in: ./Results_Optimized_Hyperparameters/v3/hybrid13/UDIADS_BIB_MS/"
 echo ""
-echo "Model: Hybrid1-Enhanced EfficientNet (CNN + Swin-Unet)"
-echo "Architecture: Swin Encoder → Enhanced EfficientNet Decoder"
+echo "Model: hybrid1 Model (EfficientNet-B4 + Swin-Unet with TransUNet Best Practices)"
+echo "Architecture: EfficientNet-B4 Encoder → Swin-Unet Decoder"
+echo "Scheduler: OneCycleLR (Peak: 10x LR, 30% warmup, cosine decay)"
 echo "Features:"
 echo "  ✓ Deep Supervision (auxiliary outputs)"
-echo "  ✓ Cross-Attention Bottleneck"
-echo "  ✓ Multi-Scale Aggregation"
-echo "  ✓ GroupNorm + CBAM + PosEmbed"
+echo "  ✓ Multi-scale Aggregation (bottleneck)"
+echo "  ✓ OneCycleLR Scheduler (optimal for hybrid CNN-transformer models)"
 echo ""
-echo "Performance Expectations:"
-echo "  • Baseline Hybrid2: IoU 0.36"
-echo "  • Expected IoU: 0.60-0.65 (+67-81% improvement!)"
-echo "  • Pure CNN Decoder with TransUNet enhancements"
-echo ""
-echo "Date: $(date)"
-echo "========================================================================"

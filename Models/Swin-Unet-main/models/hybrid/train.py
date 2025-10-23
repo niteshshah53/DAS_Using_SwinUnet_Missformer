@@ -60,7 +60,7 @@ def get_model(args, config=None):
                 pretrained=True,
                 use_deep_supervision=True,
                 use_multiscale_agg=True,
-                use_smart_skip=False
+                use_smart_skip=True
             )
         else:
             print("Loading Hybrid1 Baseline: EfficientNet-B4 + Swin-Unet...")
@@ -252,8 +252,11 @@ def parse_arguments():
     # Training configuration
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     parser.add_argument('--max_epochs', type=int, default=300, help='Maximum number of epochs')
-    parser.add_argument('--base_lr', type=float, default=0.0003, help='Base learning rate')
-    parser.add_argument('--patience', type=int, default=30, help='Early stopping patience')
+    parser.add_argument('--base_lr', type=float, default=0.0001, help='Base learning rate')
+    parser.add_argument('--patience', type=int, default=50, help='Early stopping patience')
+    parser.add_argument('--scheduler_type', type=str, default='OneCycleLR',
+                       choices=['CosineAnnealingWarmRestarts', 'OneCycleLR', 'ReduceLROnPlateau', 'CosineAnnealingLR'],
+                       help='Learning rate scheduler type')
     parser.add_argument('--n_gpu', type=int, default=1, help='Number of GPUs')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers')
     parser.add_argument('--seed', type=int, default=1234, help='Random seed')

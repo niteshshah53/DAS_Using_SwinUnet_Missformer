@@ -183,7 +183,7 @@ def get_model(args, config=None):
         use_enhanced = getattr(args, 'use_enhanced', False)
         
         if use_enhanced:
-            print("Loading Hybrid1 Enhanced with TransUNet Best Practices for testing...")
+            print("Loading Hybrid1 Best Practices for testing...")
             from hybrid1.hybrid_model import create_hybrid_model
             model = create_hybrid_model(
                 num_classes=args.num_classes,
@@ -191,7 +191,7 @@ def get_model(args, config=None):
                 pretrained=False,  # Not needed for testing
                 use_deep_supervision=True,
                 use_multiscale_agg=True,
-                use_smart_skip=False
+                use_smart_skip=True
             ).cuda()
         else:
             print("Loading Hybrid1 Baseline for testing...")

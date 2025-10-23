@@ -126,7 +126,7 @@ def compute_class_weights(train_dataset, num_classes):
     class_freq = class_counts / class_counts.sum()
 
     # Use proper inverse frequency weighting with smoothing
-    weights = 1.0 / (class_freq + 0.01)  # Add small epsilon to prevent extreme weights
+    weights = 1.0 / (class_freq + 0.00001)  # Add small epsilon to prevent extreme weights
     weights = weights / weights.sum() * num_classes  # Normalize
 
     # Print
@@ -260,7 +260,7 @@ def compute_combined_loss(predictions, labels, ce_loss, focal_loss, dice_loss):
         return 0.4 * loss_ce + 0.1 * loss_focal + 0.5 * loss_dice       
 
 
-def create_optimizer_and_scheduler(model, learning_rate, args=None):
+def create_optimizer_and_scheduler(model, learning_rate, args=None, train_loader=None):
     """
     Create optimizer and learning rate scheduler.
     
@@ -268,6 +268,7 @@ def create_optimizer_and_scheduler(model, learning_rate, args=None):
         model: Neural network model
         learning_rate (float): Initial learning rate
         args: Command line arguments (optional)
+        train_loader: Training data loader (optional, needed for OneCycleLR)
         
     Returns:
         tuple: (optimizer, scheduler)
@@ -318,25 +319,75 @@ def create_optimizer_and_scheduler(model, learning_rate, args=None):
         eps=1e-8
     )
     
-    # CosineAnnealingWarmRestarts scheduler for all groups
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=50,  # Restart every 50 epochs
-        T_mult=2,  # Double period after each restart
-        eta_min=1e-6
-    )
+    # Select scheduler based on args
+    scheduler_type = getattr(args, 'scheduler_type', 'CosineAnnealingWarmRestarts')
+    max_epochs = getattr(args, 'max_epochs', 300)
+    
+    if scheduler_type == 'OneCycleLR':
+        # OneCycleLR scheduler - optimal for hybrid CNN-transformer models
+        if train_loader is not None:
+            # Calculate actual steps per epoch from data loader
+            steps_per_epoch = len(train_loader)
+            total_steps = max_epochs * steps_per_epoch
+            print(f"  📊 OneCycleLR: {steps_per_epoch} steps/epoch × {max_epochs} epochs = {total_steps} total steps")
+        else:
+            # Fallback: estimate steps per epoch
+            total_steps = max_epochs * 1000  # Estimate: ~1000 steps per epoch
+            print(f"  📊 OneCycleLR: Estimated {total_steps} total steps (1000 steps/epoch)")
+        
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=[learning_rate * 10, learning_rate * 5, learning_rate * 10],  # Peak LRs for each group
+            total_steps=total_steps,
+            pct_start=0.3,  # 30% warmup
+            anneal_strategy='cos',
+            div_factor=10,  # Initial LR = max_lr/10
+            final_div_factor=100  # Final LR = max_lr/1000
+        )
+        scheduler_name = "OneCycleLR (Peak: 10x, Warmup: 30%, Cosine)"
+        
+    elif scheduler_type == 'ReduceLROnPlateau':
+        # ReduceLROnPlateau scheduler - adaptive based on validation loss
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.5,
+            patience=15,  # Wait 15 epochs before reducing
+            min_lr=1e-6,
+            verbose=True
+        )
+        scheduler_name = "ReduceLROnPlateau (factor=0.5, patience=15)"
+        
+    elif scheduler_type == 'CosineAnnealingLR':
+        # CosineAnnealingLR scheduler - smooth decay without restarts
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max_epochs,
+            eta_min=1e-6
+        )
+        scheduler_name = f"CosineAnnealingLR (T_max={max_epochs})"
+        
+    else:
+        # CosineAnnealingWarmRestarts scheduler
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=50,  # Restart every 50 epochs
+            T_mult=2,  # Double period after each restart
+            eta_min=1e-7
+        )
+        scheduler_name = "CosineAnnealingWarmRestarts (T_0=50, T_mult=2)"
     
     print("🚀 TransUNet Best Practice: Differential Learning Rates")
     print(f"  📊 Encoder LR:  {learning_rate * 0.1:.6f} (10x smaller, {len(encoder_params)} params)")
     print(f"  📊 Adapter LR:  {learning_rate * 0.5:.6f} (5x smaller, {len(adapter_params)} params)")
     print(f"  📊 Decoder LR:  {learning_rate:.6f} (base LR, {len(decoder_params)} params)")
-    print(f"  ⚙️  Scheduler: CosineAnnealingWarmRestarts (T_0=50, T_mult=2)")
+    print(f"  ⚙️  Scheduler: {scheduler_name}")
     print(f"  ⚙️  Weight decay: Encoder=1e-3, Adapters=5e-3, Decoder=1e-2")
     
     return optimizer, scheduler
 
 
-def run_training_epoch(model, train_loader, ce_loss, focal_loss, dice_loss, optimizer, class_weights):
+def run_training_epoch(model, train_loader, ce_loss, focal_loss, dice_loss, optimizer, class_weights, scheduler=None, scheduler_type='CosineAnnealingWarmRestarts'):
     """
     Run one training epoch.
     
@@ -346,6 +397,8 @@ def run_training_epoch(model, train_loader, ce_loss, focal_loss, dice_loss, opti
         ce_loss, focal_loss, dice_loss: Loss functions
         optimizer: Optimizer
         class_weights: Class weights for Dice loss
+        scheduler: Learning rate scheduler (optional)
+        scheduler_type: Type of scheduler (for OneCycleLR step handling)
         
     Returns:
         float: Average training loss for this epoch
@@ -376,6 +429,10 @@ def run_training_epoch(model, train_loader, ce_loss, focal_loss, dice_loss, opti
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         optimizer.step()
+        
+        # Step scheduler for OneCycleLR (step-based scheduler)
+        if scheduler is not None and scheduler_type == 'OneCycleLR':
+            scheduler.step()
         
         total_loss += loss.item()
     
@@ -502,7 +559,10 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
     
     # Create loss functions, optimizer, and scheduler
     ce_loss, focal_loss, dice_loss = create_loss_functions(class_weights, args.num_classes)
-    optimizer, scheduler = create_optimizer_and_scheduler(model, args.base_lr, args)
+    optimizer, scheduler = create_optimizer_and_scheduler(model, args.base_lr, args, train_loader)
+    
+    # Get scheduler type for training loop
+    scheduler_type = getattr(args, 'scheduler_type', 'CosineAnnealingWarmRestarts')
     
     # Set up TensorBoard logging
     writer = SummaryWriter(os.path.join(snapshot_path, 'tensorboard_logs'))
@@ -524,7 +584,7 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
         print("-" * 50)
         
         # Training phase
-        train_loss = run_training_epoch(model, train_loader, ce_loss, focal_loss, dice_loss, optimizer, class_weights)
+        train_loss = run_training_epoch(model, train_loader, ce_loss, focal_loss, dice_loss, optimizer, class_weights, scheduler, scheduler_type)
         
         # Validation phase
         val_loss = validate_with_sliding_window(model, val_dataset, ce_loss, focal_loss, dice_loss)
@@ -553,8 +613,12 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
             epochs_without_improvement += 1
             print(f"    ⚠ No improvement for {epochs_without_improvement} epochs (patience: {patience}, remaining: {patience - epochs_without_improvement})")
         
-        # Learning rate scheduling - CRITICAL: This was missing!
-        scheduler.step()
+        # Learning rate scheduling - handle different scheduler types
+        if scheduler_type == 'ReduceLROnPlateau':
+            scheduler.step(val_loss)  # ReduceLROnPlateau needs validation loss
+        elif scheduler_type != 'OneCycleLR':
+            scheduler.step()  # Other epoch-based schedulers step automatically
+        # OneCycleLR is already stepped in run_training_epoch
         
         # Early stopping check
         if epochs_without_improvement >= patience:

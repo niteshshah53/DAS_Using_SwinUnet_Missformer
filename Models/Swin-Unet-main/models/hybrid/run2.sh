@@ -1,12 +1,13 @@
 #!/bin/bash -l
 #SBATCH --job-name=hybrid_train_test
-#SBATCH --output=./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_FS/train_test_optuna_%j.out
-#SBATCH --error=./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_FS/train_test_optuna_%j.out
+#SBATCH --output=./Results_Optimized_Hyperparameters/v2/hybrid12/UDIADS_BIB_FS/train_test_optuna_%j.out
+#SBATCH --error=./Results_Optimized_Hyperparameters/v2/hybrid12/UDIADS_BIB_FS/train_test_optuna_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --time=24:00:00
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:rtx3080:1
+#SBATCH --partition=rtx3080
 
 #SBATCH --export=NONE
 unset SLURM_EXPORT_ENV
@@ -19,14 +20,7 @@ module load cudnn
 
 # Create logs directory 
 mkdir -p ../../logs
-mkdir -p ./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_FS
-
-# Training configuration for Hybrid2:
-# - model: hybrid1 (Swin-EfficientNet hybrid)
-# - dataset: UDIADS_BIB (5 classes for Syr341FS, 6 classes for others)
-# - efficientnet_variant: b4 (balanced performance)
-# - base_lr: Initial learning rate
-# - patience: Early stopping patience
+mkdir -p ./Results_Optimized_Hyperparameters/v2/hybrid12/UDIADS_BIB_FS
 
 conda activate pytorch2.6-py3.12
 
@@ -48,9 +42,10 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --use_patched_data \
         --batch_size 4 \
         --max_epochs 300 \
-        --base_lr 0.0002 \
+        --base_lr 0.0001 \
         --patience 50 \
-        --output_dir "./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_FS/udiadsbib_Hybrid1_enhanced_${MANUSCRIPT}"
+        --scheduler_type OneCycleLR \
+        --output_dir "./Results_Optimized_Hyperparameters/v2/hybrid12/UDIADS_BIB_FS/udiadsbib_Hybrid1_enhanced_${MANUSCRIPT}"
 
     echo "=== Testing Hybrid2 $MANUSCRIPT ==="
     python3 test.py \
@@ -62,5 +57,5 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --use_patched_data \
         --is_savenii \
         --use_tta \
-        --output_dir "./Results_Optimized_Hyperparameters/v2/hybrid1/UDIADS_BIB_FS/udiadsbib_Hybrid1_enhanced_${MANUSCRIPT}"
+        --output_dir "./Results_Optimized_Hyperparameters/v2/hybrid12/UDIADS_BIB_FS/udiadsbib_Hybrid1_enhanced_${MANUSCRIPT}"
 done

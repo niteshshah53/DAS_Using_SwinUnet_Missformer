@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=hybrid1_divahisdb
-#SBATCH --output=./Results_Optimized_Hyperparameters/v2/hybrid1/DIVAHISDB/train_test_optuna_%j.out
-#SBATCH --error=./Results_Optimized_Hyperparameters/v2/hybrid1/DIVAHISDB/train_test_optuna_%j.out
+#SBATCH --output=./Results_Optimized_Hyperparameters/v3/hybrid12/DIVAHISDB/train_test_optuna_%j.out
+#SBATCH --error=./Results_Optimized_Hyperparameters/v3/hybrid12/DIVAHISDB/train_test_optuna_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -20,10 +20,10 @@ module load cudnn
 
 # Create logs directory 
 mkdir -p ../../logs
-mkdir -p ./Results_Optimized_Hyperparameters/v2/hybrid1/DIVAHISDB
+mkdir -p ./Results_Optimized_Hyperparameters/v3/hybrid12/DIVAHISDB
 
-# Training configuration for Hybrid1 on DIVAHISDB:
-# - model: hybrid1 (EfficientNet-Swin Encoder + Swin-Unet Decoder)
+# Training configuration for Hybrid12 on DIVAHISDB:
+# - model: hybrid12 (EfficientNet-Swin Encoder + Swin-Unet Decoder)
 # - dataset: DIVAHISDB (4 classes: Background, Comment, Decoration, Main Text)
 # - base_lr: 0.0002 (optimal learning rate)
 # - patience: Early stopping patience
@@ -35,7 +35,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0
 
 # Train all manuscripts one by one for DIVAHISDB (CB55, CSG18, CSG863)
-MANUSCRIPTS=(CB55 CSG18 CSG863) 
+MANUSCRIPTS=(CSG863) 
 
 for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
     echo "=== Training Hybrid1-Enhanced EfficientNet $MANUSCRIPT ==="
@@ -49,9 +49,10 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --num_classes 4 \
         --batch_size 4 \
         --max_epochs 300 \
-        --base_lr 0.0002 \
+        --base_lr 0.0001 \
+        --scheduler_type OneCycleLR \
         --patience 50 \
-        --output_dir "./Results_Optimized_Hyperparameters/v2/hybrid1/DIVAHISDB/Hybrid1_enhanced_${MANUSCRIPT}"
+        --output_dir "./Results_Optimized_Hyperparameters/v3/hybrid12/DIVAHISDB/divahisdb_Hybrid1_${MANUSCRIPT}"
 
     echo "=== Testing Hybrid1-Enhanced EfficientNet $MANUSCRIPT ==="
     python3 test.py \
@@ -64,5 +65,5 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --num_classes 4 \
         --is_savenii \
         --use_tta \
-        --output_dir "./Results_Optimized_Hyperparameters/v2/hybrid1/DIVAHISDB/Hybrid1_enhanced_${MANUSCRIPT}"
+        --output_dir "./Results_Optimized_Hyperparameters/v3/hybrid12/DIVAHISDB/divahisdb_Hybrid1_${MANUSCRIPT}"
 done
