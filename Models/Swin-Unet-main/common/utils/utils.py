@@ -29,44 +29,138 @@ class FocalLoss(nn.Module):
     
 
 class DiceLoss(nn.Module):
-    def __init__(self, n_classes):
+    """
+    Dice Loss with proper weight handling and NaN prevention.
+    
+    Fixes from original:
+    - Added weight parameter to __init__
+    - Increased smooth from 1e-5 to 1e-4 for stability
+    - Added NaN detection and handling
+    - Fixed normalization (sum of weights instead of n_classes)
+    - Prevent division by zero for empty classes
+    """
+    def __init__(self, n_classes, weight=None, smooth=1e-4):
         super(DiceLoss, self).__init__()
         self.n_classes = n_classes
+        self.weight = weight  # Store default weight
+        self.smooth = smooth  # Increased for numerical stability
 
     def _one_hot_encoder(self, input_tensor):
         tensor_list = []
         for i in range(self.n_classes):
-            temp_prob = input_tensor == i  # * torch.ones_like(input_tensor)
+            temp_prob = input_tensor == i
             tensor_list.append(temp_prob.unsqueeze(1))
         output_tensor = torch.cat(tensor_list, dim=1)
         return output_tensor.float()
 
     def _dice_loss(self, score, target):
+        """
+        Compute Dice loss for a single class with NaN prevention.
+        """
         target = target.float()
-        smooth = 1e-5
+        smooth = self.smooth
+        
+        # Check for NaN in inputs before computation
+        if torch.isnan(score).any() or torch.isnan(target).any():
+            # If inputs contain NaN, return 0 loss to avoid propagating NaN
+            return torch.tensor(0.0, device=score.device, dtype=score.dtype)
+        
+        # Clamp values to prevent overflow/underflow
+        score = torch.clamp(score, min=0.0, max=1.0)
+        target = torch.clamp(target, min=0.0, max=1.0)
+        
         intersect = torch.sum(score * target)
         y_sum = torch.sum(target * target)
         z_sum = torch.sum(score * score)
-        loss = (2 * intersect + smooth) / (z_sum + y_sum + smooth)
-        loss = 1 - loss
+        union = z_sum + y_sum
+        
+        # Check for NaN in computed values
+        if torch.isnan(intersect) or torch.isnan(union):
+            # Return 0 loss if computation produced NaN
+            return torch.tensor(0.0, device=score.device, dtype=score.dtype)
+        
+        # CRITICAL FIX: Prevent NaN when both prediction and target are empty
+        # If union is extremely small, return 0 loss (perfect for absent class)
+        if union < smooth * 10:
+            return torch.tensor(0.0, device=score.device, dtype=score.dtype)
+        
+        dice_coef = (2 * intersect + smooth) / (union + smooth)
+        loss = 1 - dice_coef
+        
+        # Safety check for NaN in final loss (shouldn't happen with above fixes)
+        if torch.isnan(loss):
+            return torch.tensor(0.0, device=score.device, dtype=score.dtype)
+        
         return loss
 
     def forward(self, inputs, target, weight=None, softmax=False):
+        """
+        Forward pass with proper weight handling.
+        
+        Args:
+            inputs: Model predictions [B, C, H, W]
+            target: Ground truth labels [B, H, W]
+            weight: Optional class weights (overrides self.weight if provided)
+            softmax: Whether to apply softmax to inputs
+        """
+        # Check for NaN or Inf in inputs before processing
+        if torch.isnan(inputs).any() or torch.isinf(inputs).any():
+            # Replace NaN/Inf with zeros to prevent propagation
+            inputs = torch.where(torch.isnan(inputs) | torch.isinf(inputs), 
+                                torch.zeros_like(inputs), inputs)
+        
         if softmax:
             inputs = torch.softmax(inputs, dim=1)
+            # Check again after softmax in case it produced NaN
+            if torch.isnan(inputs).any():
+                inputs = torch.where(torch.isnan(inputs), 
+                                    torch.zeros_like(inputs), inputs)
+                # Renormalize to ensure valid probability distribution
+                inputs = inputs / (inputs.sum(dim=1, keepdim=True) + 1e-8)
+        
         target = self._one_hot_encoder(target)
-        if weight is None:
-            weight = [1] * self.n_classes
-        elif isinstance(weight, torch.Tensor):
-            weight = weight.cpu().numpy().tolist()
-        assert inputs.size() == target.size(), 'predict {} & target {} shape do not match'.format(inputs.size(), target.size())
-        class_wise_dice = []
+        
+        # Determine which weights to use
+        if weight is not None:
+            # Use provided weight (from forward call)
+            if isinstance(weight, torch.Tensor):
+                class_weights = weight.cpu().numpy().tolist()
+            else:
+                class_weights = weight
+        elif self.weight is not None:
+            # Use weight from __init__
+            if isinstance(self.weight, torch.Tensor):
+                class_weights = self.weight.cpu().numpy().tolist()
+            else:
+                class_weights = self.weight
+        else:
+            # No weights provided, use uniform weights
+            class_weights = [1] * self.n_classes
+        
+        # Size check
+        assert inputs.size() == target.size(), \
+            f'predict {inputs.size()} & target {target.size()} shape do not match'
+        
+        # Compute weighted Dice loss per class
         loss = 0.0
-        for i in range(0, self.n_classes):
+        total_weight = 0.0
+        
+        for i in range(self.n_classes):
             dice = self._dice_loss(inputs[:, i], target[:, i])
-            class_wise_dice.append(1.0 - dice.item())
-            loss += dice * weight[i]
-        return loss / self.n_classes
+            
+            # Skip NaN losses (shouldn't happen with fixes)
+            if not torch.isnan(dice):
+                loss += dice * class_weights[i]
+                total_weight += class_weights[i]
+        
+        # CRITICAL FIX: Normalize by sum of weights, not n_classes
+        # This properly handles weighted classes
+        if total_weight > 0:
+            return loss / total_weight
+        else:
+            # Fallback (should never happen)
+            print("⚠️  No valid classes in Dice Loss!")
+            return torch.tensor(0.0, device=inputs.device, dtype=inputs.dtype)
 
 
 def calculate_metric_percase(pred, gt):

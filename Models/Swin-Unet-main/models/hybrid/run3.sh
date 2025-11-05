@@ -1,13 +1,12 @@
 #!/bin/bash -l
 #SBATCH --job-name=hybrid1_divahisdb
-#SBATCH --output=./Results_Optimized_Hyperparameters/v3/hybrid12/DIVAHISDB/train_test_optuna_%j.out
-#SBATCH --error=./Results_Optimized_Hyperparameters/v3/hybrid12/DIVAHISDB/train_test_optuna_%j.out
+#SBATCH --output=./Results_Optimized_Hyperparameters/hybrid1/DIVAHISDB/train_test_optuna_%j.out
+#SBATCH --error=./Results_Optimized_Hyperparameters/hybrid1/DIVAHISDB/train_test_optuna_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --time=24:00:00
-#SBATCH --gres=gpu:rtx3080:1
-#SBATCH --partition=rtx3080
+#SBATCH --gres=gpu:1
 
 #SBATCH --export=NONE
 unset SLURM_EXPORT_ENV
@@ -20,7 +19,7 @@ module load cudnn
 
 # Create logs directory 
 mkdir -p ../../logs
-mkdir -p ./Results_Optimized_Hyperparameters/v3/hybrid12/DIVAHISDB
+mkdir -p ./Results_Optimized_Hyperparameters/hybrid1/DIVAHISDB
 
 # Training configuration for Hybrid12 on DIVAHISDB:
 # - model: hybrid12 (EfficientNet-Swin Encoder + Swin-Unet Decoder)
@@ -47,12 +46,12 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --manuscript ${MANUSCRIPT} \
         --use_patched_data \
         --num_classes 4 \
-        --batch_size 4 \
+        --batch_size 8 \
         --max_epochs 300 \
-        --base_lr 0.0001 \
+        --base_lr 0.001 \
         --scheduler_type OneCycleLR \
         --patience 50 \
-        --output_dir "./Results_Optimized_Hyperparameters/v3/hybrid12/DIVAHISDB/divahisdb_Hybrid1_${MANUSCRIPT}"
+        --output_dir "./Results_Optimized_Hyperparameters/hybrid1/DIVAHISDB/divahisdb_Hybrid1_${MANUSCRIPT}"
 
     echo "=== Testing Hybrid1-Enhanced EfficientNet $MANUSCRIPT ==="
     python3 test.py \
@@ -65,5 +64,5 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --num_classes 4 \
         --is_savenii \
         --use_tta \
-        --output_dir "./Results_Optimized_Hyperparameters/v3/hybrid12/DIVAHISDB/divahisdb_Hybrid1_${MANUSCRIPT}"
+        --output_dir "./Results_Optimized_Hyperparameters/hybrid1/DIVAHISDB/divahisdb_Hybrid1_${MANUSCRIPT}"
 done

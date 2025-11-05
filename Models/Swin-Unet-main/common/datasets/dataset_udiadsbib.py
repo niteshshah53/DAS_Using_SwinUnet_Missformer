@@ -10,6 +10,10 @@ import torchvision.transforms.functional as TF
 from torchvision import transforms as tvtf
 from functools import partial
 import multiprocessing
+from scipy import ndimage
+from PIL import ImageFilter
+import math
+import numpy as np
 
 def default_transform(image, mask_class, img_size=(448, 448)):
     # Resize
@@ -40,6 +44,98 @@ def default_transform(image, mask_class, img_size=(448, 448)):
 # Top-level transform functions for Windows compatibility
 def training_transform(img, mask, patch_size):
     return default_transform(img, mask, img_size=(patch_size, patch_size))
+
+
+def strong_training_transform(img, mask, patch_size,
+                              prob_flip=0.5,
+                              prob_rotate=0.3,
+                              prob_brightness=0.5,
+                              prob_contrast=0.5,
+                              prob_gamma=0.3,
+                              prob_blur=0.25,
+                              prob_elastic=0.2,
+                              max_elastic_alpha=34,
+                              elastic_sigma=4):
+    """
+    Strong augmentations for document segmentation. All inputs are PIL image and
+    numpy mask (H,W). Returns augmented (PIL image, numpy mask).
+    """
+    # Ensure PIL image, numpy mask
+    if not isinstance(img, Image.Image):
+        img = Image.fromarray(np.array(img))
+
+    # Resize to patch size first (if needed)
+    if img.size != (patch_size, patch_size):
+        img = img.resize((patch_size, patch_size), Image.BILINEAR)
+        mask = Image.fromarray(mask.astype(np.uint8)).resize((patch_size, patch_size), Image.NEAREST)
+        mask = np.array(mask)
+
+    # Random flips
+    if random.random() < prob_flip:
+        if random.random() < 0.5:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+            mask = np.fliplr(mask)
+        if random.random() < 0.5:
+            img = img.transpose(Image.FLIP_TOP_BOTTOM)
+            mask = np.flipud(mask)
+
+    # Small random rotation (90-degree rotations handled elsewhere)
+    if random.random() < prob_rotate:
+        angle = random.uniform(-15, 15)
+        img = img.rotate(angle, resample=Image.BILINEAR)
+        mask = Image.fromarray(mask.astype(np.uint8)).rotate(angle, resample=Image.NEAREST)
+        mask = np.array(mask)
+
+    # Photometric transforms (cautious)
+    # Brightness
+    if random.random() < prob_brightness:
+        factor = random.uniform(0.8, 1.2)
+        img = TF.adjust_brightness(img, factor)
+
+    # Contrast
+    if random.random() < prob_contrast:
+        factor = random.uniform(0.85, 1.15)
+        img = TF.adjust_contrast(img, factor)
+
+    # Gamma
+    if random.random() < prob_gamma:
+        gamma = random.uniform(0.9, 1.2)
+        img = TF.adjust_gamma(img, gamma)
+
+    # Gaussian blur
+    if random.random() < prob_blur:
+        radius = random.uniform(0.0, 1.5)
+        img = img.filter(ImageFilter.GaussianBlur(radius=radius))
+
+    # Elastic deformation (applied to both image and mask)
+    if random.random() < prob_elastic:
+        alpha = random.uniform(0, max_elastic_alpha)
+        sigma = elastic_sigma
+        # convert to numpy arrays
+        img_np = np.array(img)
+        mask_np = np.array(mask)
+        shape = img_np.shape[:2]
+
+        # generate displacement fields
+        dx = ndimage.gaussian_filter((np.random.rand(*shape) * 2 - 1), sigma, mode="reflect") * alpha
+        dy = ndimage.gaussian_filter((np.random.rand(*shape) * 2 - 1), sigma, mode="reflect") * alpha
+
+        x, y = np.meshgrid(np.arange(shape[1]), np.arange(shape[0]))
+        indices = np.reshape(y + dy, (-1, 1)), np.reshape(x + dx, (-1, 1))
+
+        # remap each channel
+        warped = np.zeros_like(img_np)
+        for c in range(img_np.shape[2]):
+            warped[:, :, c] = ndimage.map_coordinates(img_np[:, :, c], indices, order=1, mode='reflect').reshape(shape)
+
+        # remap mask with nearest neighbor
+        warped_mask = ndimage.map_coordinates(mask_np, indices, order=0, mode='reflect').reshape(shape)
+
+        img = Image.fromarray(warped.astype(np.uint8))
+        mask = warped_mask
+
+    mask = mask.copy()
+    return img, mask
 
 def identity_transform(img, mask):
     return img, mask
@@ -120,10 +216,14 @@ class UDiadsBibDataset(Dataset):
                 else:
                     self.transform = identity_transform
             else:
-                # Default transforms for other models (same as SwinUnet)
+                # Default transforms for other models. For the 'swinunet' / network
+                # model we use stronger augmentations to improve generalization.
                 if split == 'training':
                     # bind patch_size so the transform is a picklable top-level callable
-                    self.transform = partial(training_transform, patch_size=patch_size)
+                    if model_type and model_type.lower() == 'swinunet':
+                        self.transform = partial(strong_training_transform, patch_size=patch_size)
+                    else:
+                        self.transform = partial(training_transform, patch_size=patch_size)
                 else:
                     self.transform = identity_transform
         else:
