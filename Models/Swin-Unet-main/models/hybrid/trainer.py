@@ -74,6 +74,7 @@ def setup_logging(output_path):
 def compute_class_weights(train_dataset, num_classes):
     """
     Compute class weights for balanced training based on pixel frequency.
+    Uses square root of inverse frequency for extreme imbalances (better than linear).
     Args:
         train_dataset: Training dataset object with .mask_paths
         num_classes (int): Number of segmentation classes
@@ -103,6 +104,8 @@ def compute_class_weights(train_dataset, num_classes):
             (255, 0, 0): 4,      # Title
             # Note: Chapter Heading (0, 255, 0) is not present in Syriaque341
         }
+        # Also count Chapter Headings pixels but don't include in class map
+        chapter_headings_color = (0, 255, 0)
     elif num_classes == 4:
         # DivaHisDB color map
         COLOR_MAP = {
@@ -111,33 +114,81 @@ def compute_class_weights(train_dataset, num_classes):
             (255, 0, 0): 2,      # Decoration
             (0, 0, 255): 3,      # Main Text
         }
+        chapter_headings_color = None
     else:
         raise ValueError(f"Unsupported number of classes: {num_classes}")
 
     class_counts = np.zeros(num_classes, dtype=np.float64)
+    unmapped_pixel_count = 0
+    chapter_headings_count = 0
 
     for mask_path in train_dataset.mask_paths:
         mask = np.array(Image.open(mask_path).convert("RGB"))
+        
+        # Track mapped pixels
+        mapped_mask = np.zeros(mask.shape[:2], dtype=bool)
+        
         for rgb, cls in COLOR_MAP.items():
             matches = np.all(mask == rgb, axis=-1)
             class_counts[cls] += np.sum(matches)
+            mapped_mask[matches] = True
+        
+        # For 5-class mode: count Chapter Headings pixels separately
+        if num_classes == 5 and chapter_headings_color is not None:
+            chapter_matches = np.all(mask == chapter_headings_color, axis=-1)
+            chapter_headings_count += np.sum(chapter_matches)
+            mapped_mask[chapter_matches] = True
+        
+        # Count unmapped pixels
+        unmapped_pixels = ~mapped_mask
+        if np.any(unmapped_pixels):
+            unmapped_pixel_count += np.sum(unmapped_pixels)
+
+    # Report Chapter Headings pixels if found in 5-class mode
+    if num_classes == 5 and chapter_headings_count > 0:
+        print(f"\n⚠️  WARNING: Found {chapter_headings_count:,} Chapter Headings pixels in Syr341FS!")
+        print(f"   These will be mapped to Background (class 0)")
+        print(f"   This may contribute to class imbalance.")
 
     # Compute frequencies
-    class_freq = class_counts / class_counts.sum()
+    total_pixels = class_counts.sum()
+    if total_pixels == 0:
+        raise ValueError("No pixels found in masks!")
+    
+    class_freq = class_counts / total_pixels
 
-    # Use proper inverse frequency weighting with smoothing
-    weights = 1.0 / (class_freq + 0.00001)  # Add small epsilon to prevent extreme weights
-    weights = weights / weights.sum() * num_classes  # Normalize
+    # Use square root of inverse frequency for extreme imbalances
+    # This is less aggressive than linear inverse frequency but still helps rare classes
+    # Formula: sqrt(1 / (freq + epsilon)) then normalize
+    epsilon = 1e-6
+    weights = np.sqrt(1.0 / (class_freq + epsilon))
+    
+    # Normalize weights to sum to num_classes (balanced baseline)
+    weights = weights / weights.sum() * num_classes
+    
+    # For extremely rare classes (< 0.5%), apply additional boost
+    rare_threshold = 0.005  # 0.5%
+    for cls in range(num_classes):
+        if class_freq[cls] < rare_threshold and class_freq[cls] > 0:
+            boost_factor = 1.5  # 50% boost for rare classes
+            weights[cls] *= boost_factor
+    
+    # Renormalize after boosting
+    weights = weights / weights.sum() * num_classes
 
-    # Print
+    # Print detailed analysis
     print("\n" + "-"*80)
     print("CLASS DISTRIBUTION ANALYSIS")
     print("-"*80)
-    print(f"{'Class':<6} {'Frequency':<15} {'Weight':<15}")
+    print(f"{'Class':<6} {'Frequency':<15} {'Weight':<15} {'Pixels':<15}")
     print("-"*80)
     for cls in range(num_classes):
-        print(f"{cls:<6} {class_freq[cls]:<15.6f} {weights[cls]:<15.6f}")
-    print("-"*80 + "\n")
+        pixel_count = int(class_counts[cls])
+        print(f"{cls:<6} {class_freq[cls]:<15.6f} {weights[cls]:<15.6f} {pixel_count:<15,}")
+    print("-"*80)
+    if unmapped_pixel_count > 0:
+        print(f"\n⚠️  Unmapped pixels: {unmapped_pixel_count:,} (mapped to Background)")
+    print()
 
     # Return as tensor
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -158,6 +209,21 @@ def create_data_loaders(train_dataset, val_dataset, batch_size, num_workers, see
     Returns:
         tuple: (train_loader, val_loader)
     """
+    # Validate that datasets are not empty
+    if len(train_dataset) == 0:
+        raise ValueError(
+            f"Training dataset is empty! Found 0 samples.\n"
+            f"This usually means the dataset directories don't exist or are empty.\n"
+            f"Please check that the dataset path is correct and contains the expected files."
+        )
+    
+    if len(val_dataset) == 0:
+        raise ValueError(
+            f"Validation dataset is empty! Found 0 samples.\n"
+            f"This usually means the dataset directories don't exist or are empty.\n"
+            f"Please check that the dataset path is correct and contains the expected files."
+        )
+    
     # On Windows, reduce num_workers to avoid multiprocessing issues
     if os.name == 'nt':  # Windows
         num_workers = min(num_workers, 2)
@@ -205,7 +271,7 @@ def create_loss_functions(class_weights, num_classes):
     ce_loss = CrossEntropyLoss(weight=class_weights)
     
     # Reduce focal loss gamma (5 is too aggressive, causes instability)
-    focal_loss = FocalLoss(gamma=2)  # Changed from 5 to 2
+    focal_loss = FocalLoss(gamma=3)  # Changed from 5 to 2
     
     # Dice loss doesn't use class weights directly
     dice_loss = DiceLoss(num_classes)
@@ -245,7 +311,7 @@ def compute_combined_loss(predictions, labels, ce_loss, focal_loss, dice_loss):
             aux_ce = ce_loss(aux_output, labels)
             aux_focal = focal_loss(aux_output, labels)
             aux_dice = dice_loss(aux_output, labels, softmax=True)
-            aux_combined = 0.3 * aux_ce + 0.4 * aux_focal + 0.3 * aux_dice
+            aux_combined = 0.4 * aux_ce + 0.1 * aux_focal + 0.5 * aux_dice
             aux_loss += weight * aux_combined
         
         # Total loss: main + weighted auxiliary
@@ -353,8 +419,7 @@ def create_optimizer_and_scheduler(model, learning_rate, args=None, train_loader
             mode='min',
             factor=0.5,
             patience=15,  # Wait 15 epochs before reducing
-            min_lr=1e-6,
-            verbose=True
+            min_lr=1e-6
         )
         scheduler_name = "ReduceLROnPlateau (factor=0.5, patience=15)"
         
@@ -479,9 +544,10 @@ def validate_with_sliding_window(model, val_dataset, ce_loss, focal_loss, dice_l
     return total_loss / num_samples if num_samples > 0 else float('inf')
 
 
-def save_best_model(model, epoch, val_loss, best_val_loss, snapshot_path):
+def save_best_model(model, epoch, val_loss, best_val_loss, snapshot_path,
+                    optimizer=None, scheduler=None, scaler=None):
     """
-    Save model if it's the best so far.
+    Save model + optimizer/scheduler/scaler checkpoint if validation loss improved.
     
     Args:
         model: Neural network model
@@ -489,6 +555,9 @@ def save_best_model(model, epoch, val_loss, best_val_loss, snapshot_path):
         val_loss (float): Current validation loss
         best_val_loss (float): Best validation loss so far
         snapshot_path (str): Directory to save models
+        optimizer: Optimizer (optional)
+        scheduler: Learning rate scheduler (optional)
+        scaler: GradScaler for AMP (optional)
         
     Returns:
         tuple: (best_val_loss, improvement_made)
@@ -499,10 +568,30 @@ def save_best_model(model, epoch, val_loss, best_val_loss, snapshot_path):
         best_val_loss = val_loss
         improvement_made = True
         
-        # Save best model
         best_model_path = os.path.join(snapshot_path, 'best_model_latest.pth')
-        torch.save(model.state_dict(), best_model_path)
-        print(f"    ✓ New best model saved! Validation loss: {val_loss:.4f}")
+        
+        # Build checkpoint dict
+        model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+        checkpoint = {
+            'epoch': epoch,
+            'model_state': model_state,
+            'optimizer_state': optimizer.state_dict() if optimizer is not None else None,
+            'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
+            'best_val_loss': best_val_loss,
+        }
+        
+        # Include scaler state if provided (AMP)
+        if scaler is not None:
+            try:
+                checkpoint['scaler_state'] = scaler.state_dict()
+            except Exception:
+                # scaler may not support state_dict in some versions; ignore safely
+                pass
+        
+        # Save checkpoint
+        torch.save(checkpoint, best_model_path)
+        
+        print(f"    ✓ New best checkpoint saved! Val loss: {val_loss:.4f}")
     else:
         print(f"    No improvement (current: {val_loss:.4f}, best: {best_val_loss:.4f})")
     
@@ -564,22 +653,125 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
     # Get scheduler type for training loop
     scheduler_type = getattr(args, 'scheduler_type', 'CosineAnnealingWarmRestarts')
     
+    # Mixed precision scaler (used when CUDA is available)
+    try:
+        from torch.cuda.amp import GradScaler
+        scaler = GradScaler() if torch.cuda.is_available() else None
+    except ImportError:
+        scaler = None
+    
     # Set up TensorBoard logging
     writer = SummaryWriter(os.path.join(snapshot_path, 'tensorboard_logs'))
     
-    # Training loop
+    # Resume from checkpoint if available
+    start_epoch = 0
     best_val_loss = float('inf')
     epochs_without_improvement = 0
+    
+    checkpoint_path = os.path.join(snapshot_path, 'best_model_latest.pth')
+    if os.path.exists(checkpoint_path):
+        print(f"\n📂 Found checkpoint: {checkpoint_path}")
+        print("   Attempting to resume training...")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cuda' if torch.cuda.is_available() else 'cpu')
+            
+            # Load model state (critical - must succeed)
+            try:
+                if isinstance(model, nn.DataParallel):
+                    model.module.load_state_dict(checkpoint['model_state'], strict=False)
+                else:
+                    model.load_state_dict(checkpoint['model_state'], strict=False)
+                print("   ✓ Loaded model state")
+            except Exception as e:
+                print(f"   ⚠️  Failed to load model state: {e}")
+                raise  # Re-raise if model loading fails - cannot continue without model
+            
+            # Load optimizer state (handle parameter group mismatches gracefully)
+            if optimizer is not None and 'optimizer_state' in checkpoint and checkpoint['optimizer_state'] is not None:
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer_state'])
+                    print("   ✓ Loaded optimizer state")
+                except Exception as e:
+                    print(f"   ⚠️  Could not load optimizer state: {e}")
+                    print("   Starting with fresh optimizer state (this is OK if architecture changed)")
+            
+            # Load scheduler state (handle mismatches gracefully, especially for OneCycleLR)
+            # Check if scheduler type matches before loading state
+            if scheduler is not None and 'scheduler_state' in checkpoint and checkpoint['scheduler_state'] is not None:
+                scheduler_state = checkpoint['scheduler_state']
+                current_scheduler_type = type(scheduler).__name__
+                
+                # Check if scheduler state matches current scheduler type
+                # OneCycleLR has 'total_steps' key, CosineAnnealingWarmRestarts has 'T_0', etc.
+                state_keys = set(scheduler_state.keys())
+                is_onecycle = 'total_steps' in state_keys
+                is_cosine_warm = 'T_0' in state_keys and 'T_mult' in state_keys
+                is_cosine_simple = 'T_max' in state_keys and 'T_0' not in state_keys
+                is_reduce_on_plateau = 'mode' in state_keys and 'factor' in state_keys
+                
+                scheduler_type_match = False
+                if current_scheduler_type == 'OneCycleLR' and is_onecycle:
+                    scheduler_type_match = True
+                elif current_scheduler_type == 'CosineAnnealingWarmRestarts' and is_cosine_warm:
+                    scheduler_type_match = True
+                elif current_scheduler_type == 'CosineAnnealingLR' and is_cosine_simple:
+                    scheduler_type_match = True
+                elif current_scheduler_type == 'ReduceLROnPlateau' and is_reduce_on_plateau:
+                    scheduler_type_match = True
+                
+                if scheduler_type_match:
+                    try:
+                        scheduler.load_state_dict(scheduler_state)
+                        print("   ✓ Loaded scheduler state")
+                    except Exception as e:
+                        print(f"   ⚠️  Could not load scheduler state: {e}")
+                        print("   Starting with fresh scheduler state")
+                        # Fast-forward scheduler to current epoch if epoch-based
+                        if current_scheduler_type in ['CosineAnnealingWarmRestarts', 'CosineAnnealingLR']:
+                            for _ in range(checkpoint.get('epoch', 0)):
+                                scheduler.step()
+                            print(f"   ✓ Fast-forwarded scheduler to epoch {checkpoint.get('epoch', 0)}")
+                else:
+                    print(f"   ⚠️  Scheduler type mismatch (checkpoint has different scheduler type)")
+                    print(f"   Starting with fresh scheduler state")
+                    # Fast-forward scheduler to current epoch if epoch-based
+                    if current_scheduler_type in ['CosineAnnealingWarmRestarts', 'CosineAnnealingLR']:
+                        for _ in range(checkpoint.get('epoch', 0)):
+                            scheduler.step()
+                        print(f"   ✓ Fast-forwarded scheduler to epoch {checkpoint.get('epoch', 0)}")
+            
+            # Load scaler state
+            if scaler is not None and 'scaler_state' in checkpoint:
+                try:
+                    scaler.load_state_dict(checkpoint['scaler_state'])
+                    print("   ✓ Loaded scaler state")
+                except Exception:
+                    print("   ⚠️  Could not load scaler state, starting fresh")
+            
+            # Load training state
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+            
+            print(f"   ✓ Successfully loaded checkpoint from epoch {checkpoint.get('epoch', 0)}")
+            print(f"   ✓ Best validation loss: {best_val_loss:.4f}")
+            print(f"   ✓ Resuming from epoch {start_epoch}\n")
+        except Exception as e:
+            print(f"   ⚠️  Failed to load checkpoint: {e}")
+            print("   Starting training from scratch\n")
+    
+    # Training loop
     patience = getattr(args, 'patience', 50)  # Early stopping patience from args or default to 50
     
     print("\n" + "="*80)
     print("STARTING TRAINING")
     print("="*80)
     print(f"Early stopping patience: {patience} epochs")
-    print(f"Learning rate scheduler: CosineAnnealingWarmRestarts (better convergence for transformers)")
+    print(f"Learning rate scheduler: {scheduler_type} (better convergence for transformers)")
+    if start_epoch > 0:
+        print(f"Resuming from epoch: {start_epoch}")
     print("="*80)
     
-    for epoch in range(args.max_epochs):
+    for epoch in range(start_epoch, args.max_epochs):
         print(f"\nEPOCH {epoch+1}/{args.max_epochs}")
         print("-" * 50)
         
@@ -602,8 +794,32 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
         print(f"  • Validation Loss: {val_loss:.4f}")
         print(f"  • Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
         
+        # Save periodic checkpoint (every 100 epochs) - useful for recovery and evaluation
+        if (epoch + 1) % 100 == 0:
+            periodic_checkpoint_path = os.path.join(snapshot_path, f"epoch_{epoch + 1}.pth")
+            model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            periodic_checkpoint = {
+                'epoch': epoch,
+                'model_state': model_state,
+                'optimizer_state': optimizer.state_dict() if optimizer is not None else None,
+                'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
+                'best_val_loss': best_val_loss,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+            }
+            if scaler is not None:
+                try:
+                    periodic_checkpoint['scaler_state'] = scaler.state_dict()
+                except Exception:
+                    pass
+            torch.save(periodic_checkpoint, periodic_checkpoint_path)
+            print(f"   💾 Periodic checkpoint saved: epoch_{epoch + 1}.pth")
+        
         # Save best model and check for improvement
-        best_val_loss, improvement_made = save_best_model(model, epoch, val_loss, best_val_loss, snapshot_path)
+        best_val_loss, improvement_made = save_best_model(
+            model, epoch, val_loss, best_val_loss, snapshot_path,
+            optimizer=optimizer, scheduler=scheduler, scaler=scaler
+        )
         
         # Early stopping logic
         if improvement_made:
@@ -632,15 +848,15 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
             break
     
     print("\n" + "="*80)
-    print("TRAINING COMPLETED WITH EARLY STOPPING!")
+    print("TRAINING COMPLETED")
     print("="*80)
-    print(f"Training stopped early after {epochs_without_improvement} epochs without improvement.")
     print(f"Best Validation Loss: {best_val_loss:.4f}")
+    print(f"Total Epochs: {epoch+1}")
     print(f"Models Saved To: {snapshot_path}")
     print(f"TensorBoard Logs: {os.path.join(snapshot_path, 'tensorboard_logs')}")
     print("="*80 + "\n")
     
     writer.close()
-    logger.info(f"Training completed with early stopping after {epochs_without_improvement} epochs without improvement. Best validation loss: {best_val_loss:.4f}")
+    logger.info(f"Training completed. Best val loss: {best_val_loss:.4f}")
     
     return "Training Finished!"

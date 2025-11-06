@@ -1,0 +1,1494 @@
+"""
+Hybrid2 Components: All building blocks for Hybrid2 models
+Contains: Swin Encoder, Improvements (CBAM, CrossAttention, etc.), Decoders (Baseline & Enhanced)
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
+from einops import rearrange
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+
+
+# ============================================================================
+# SWIN TRANSFORMER COMPONENTS (Encoder)
+# ============================================================================
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+def window_partition(x, window_size):
+    """Partition input into non-overlapping windows."""
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+
+
+def window_reverse(windows, window_size, H, W):
+    """Reverse window partition to reconstruct feature map."""
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+
+
+class WindowAttention(nn.Module):
+    """Window-based multi-head self attention (W-MSA) module with relative position bias."""
+    
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        # Relative position bias table
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))
+
+        # Relative position index
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))
+        coords_flatten = torch.flatten(coords, 1)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        relative_coords[:, :, 0] += self.window_size[0] - 1
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        trunc_normal_(self.relative_position_bias_table, std=.02)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x, mask=None):
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))
+
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
+        else:
+            attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class SwinTransformerBlock(nn.Module):
+    """Swin Transformer Block."""
+    
+    def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
+                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+        if min(self.input_resolution) <= self.window_size:
+            self.shift_size = 0
+            self.window_size = min(self.input_resolution)
+        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
+
+        self.norm1 = norm_layer(dim)
+        self.attn = WindowAttention(
+            dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
+            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+        if self.shift_size > 0:
+            H, W = self.input_resolution
+            img_mask = torch.zeros((1, H, W, 1))
+            h_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            w_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            cnt = 0
+            for h in h_slices:
+                for w in w_slices:
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+
+            mask_windows = window_partition(img_mask, self.window_size)
+            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        else:
+            attn_mask = None
+
+        self.register_buffer("attn_mask", attn_mask)
+
+    def forward(self, x):
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+
+        shortcut = x
+        x = self.norm1(x)
+        x = x.view(B, H, W, C)
+
+        if self.shift_size > 0:
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_x = x
+
+        x_windows = window_partition(shifted_x, self.window_size)
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+
+        attn_windows = self.attn(x_windows, mask=self.attn_mask)
+
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+        x = x.view(B, H * W, C)
+
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        return x
+
+
+class PatchMerging(nn.Module):
+    """Patch Merging Layer."""
+    
+    def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.dim = dim
+        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.norm = norm_layer(4 * dim)
+
+    def forward(self, x):
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+        assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
+
+        x = x.view(B, H, W, C)
+        x0 = x[:, 0::2, 0::2, :]
+        x1 = x[:, 1::2, 0::2, :]
+        x2 = x[:, 0::2, 1::2, :]
+        x3 = x[:, 1::2, 1::2, :]
+        x = torch.cat([x0, x1, x2, x3], -1)
+        x = x.view(B, -1, 4 * C)
+        x = self.norm(x)
+        x = self.reduction(x)
+        return x
+
+
+class BasicLayer(nn.Module):
+    """A basic Swin Transformer layer for one stage."""
+    
+    def __init__(self, dim, input_resolution, depth, num_heads, window_size,
+                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.depth = depth
+        self.use_checkpoint = use_checkpoint
+
+        self.blocks = nn.ModuleList([
+            SwinTransformerBlock(dim=dim, input_resolution=input_resolution,
+                                 num_heads=num_heads, window_size=window_size,
+                                 shift_size=0 if (i % 2 == 0) else window_size // 2,
+                                 mlp_ratio=mlp_ratio,
+                                 qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                 drop=drop, attn_drop=attn_drop,
+                                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                                 norm_layer=norm_layer)
+            for i in range(depth)])
+
+        if downsample is not None:
+            self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
+        else:
+            self.downsample = None
+
+    def forward(self, x):
+        for blk in self.blocks:
+            if self.use_checkpoint:
+                x = checkpoint.checkpoint(blk, x)
+            else:
+                x = blk(x)
+        if self.downsample is not None:
+            x = self.downsample(x)
+        return x
+
+
+class PatchEmbed(nn.Module):
+    """Image to Patch Embedding"""
+    
+    def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
+        super().__init__()
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+        patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.patches_resolution = patches_resolution
+        self.num_patches = patches_resolution[0] * patches_resolution[1]
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        if norm_layer is not None:
+            self.norm = norm_layer(embed_dim)
+        else:
+            self.norm = None
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        assert H == self.img_size[0] and W == self.img_size[1], \
+            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+        x = self.proj(x).flatten(2).transpose(1, 2)
+        if self.norm is not None:
+            x = self.norm(x)
+        return x
+
+
+class SwinEncoder(nn.Module):
+    """
+    Swin Transformer encoder that extracts multi-scale features for segmentation.
+    
+    Provides 4 feature levels at different scales (strides 4, 8, 16, 32) suitable for CNN decoders.
+    """
+    
+    def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000,
+                 embed_dim=96, depths=[2, 2, 2, 2], num_heads=[3, 6, 12, 24],
+                 window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
+                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
+                 use_checkpoint=False, **kwargs):
+        super().__init__()
+
+        self.num_classes = num_classes
+        self.num_layers = len(depths)
+        self.embed_dim = embed_dim
+        self.ape = ape
+        self.patch_norm = patch_norm
+        self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
+        self.mlp_ratio = mlp_ratio
+
+        self.patch_embed = PatchEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
+            norm_layer=norm_layer if self.patch_norm else None)
+        num_patches = self.patch_embed.num_patches
+        patches_resolution = self.patch_embed.patches_resolution
+        self.patches_resolution = patches_resolution
+
+        if self.ape:
+            self.absolute_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+            trunc_normal_(self.absolute_pos_embed, std=.02)
+
+        self.pos_drop = nn.Dropout(p=drop_rate)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+
+        self.layers = nn.ModuleList()
+        for i_layer in range(self.num_layers):
+            layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
+                               input_resolution=(patches_resolution[0] // (2 ** i_layer),
+                                                 patches_resolution[1] // (2 ** i_layer)),
+                               depth=depths[i_layer],
+                               num_heads=num_heads[i_layer],
+                               window_size=window_size,
+                               mlp_ratio=self.mlp_ratio,
+                               qkv_bias=qkv_bias, qk_scale=qk_scale,
+                               drop=drop_rate, attn_drop=attn_drop_rate,
+                               drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                               norm_layer=norm_layer,
+                               downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
+                               use_checkpoint=use_checkpoint)
+            self.layers.append(layer)
+
+        self.norm = norm_layer(self.num_features)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward(self, x):
+        """Forward pass through Swin encoder."""
+        x = self.patch_embed(x)
+        if self.ape:
+            x = x + self.absolute_pos_embed
+        x = self.pos_drop(x)
+        
+        features = []
+        for layer in self.layers:
+            features.append(x)
+            x = layer(x)
+        
+        # Convert token sequences back to feature maps
+        feature_maps = []
+        for i, feat in enumerate(features):
+            B, L, C = feat.shape
+            H = W = int(L ** 0.5)
+            feat_map = feat.transpose(1, 2).view(B, C, H, W)
+            feature_maps.append(feat_map)
+        
+        return feature_maps
+    
+    def get_channels(self):
+        """Get the number of channels for each feature level."""
+        return [int(self.embed_dim * 2 ** i) for i in range(self.num_layers)]
+    
+    def get_strides(self):
+        """Get the stride for each feature level."""
+        return [4 * (2 ** i) for i in range(self.num_layers)]
+
+
+# ============================================================================
+# IMPROVEMENTS & ATTENTION MECHANISMS (CBAM, CrossAttention, etc.)
+# ============================================================================
+
+def get_norm_layer(channels, norm_type='group', num_groups=32):
+    """Factory function for normalization layers."""
+    if norm_type == 'group':
+        num_groups = min(num_groups, channels)
+        while channels % num_groups != 0:
+            num_groups -= 1
+        return nn.GroupNorm(num_groups=num_groups, num_channels=channels)
+    else:
+        return nn.BatchNorm2d(channels)
+
+
+class ImprovedChannelAttention(nn.Module):
+    """Channel Attention with GroupNorm."""
+    
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = self.sigmoid(avg_out + max_out)
+        return x * out
+
+
+class ImprovedSpatialAttention(nn.Module):
+    """Spatial Attention Module."""
+    
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avg_out, max_out], dim=1)
+        out = self.sigmoid(self.conv(out))
+        return x * out
+
+
+class ImprovedCBAM(nn.Module):
+    """CBAM (Convolutional Block Attention Module) with GroupNorm support."""
+    
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.channel_attention = ImprovedChannelAttention(channels, reduction)
+        self.spatial_attention = ImprovedSpatialAttention()
+    
+    def forward(self, x):
+        x = self.channel_attention(x)
+        x = self.spatial_attention(x)
+        return x
+
+
+class ImprovedSmartSkipConnection(nn.Module):
+    """Smart Skip Connection with GroupNorm and CBAM attention."""
+    
+    def __init__(self, encoder_channels, decoder_channels, fusion_type='concat', use_pos_embed=True):
+        super().__init__()
+        self.fusion_type = fusion_type
+        self.use_pos_embed = use_pos_embed
+        
+        self.align = nn.Sequential(
+            nn.Conv2d(encoder_channels, decoder_channels, 1, bias=False),
+            get_norm_layer(decoder_channels, 'group'),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.attention = ImprovedCBAM(decoder_channels)
+        
+        if fusion_type == 'add':
+            self.fuse = None
+        elif fusion_type == 'concat':
+            self.fuse = nn.Sequential(
+                nn.Conv2d(decoder_channels * 2, decoder_channels, 3, padding=1, bias=False),
+                get_norm_layer(decoder_channels, 'group'),
+                nn.ReLU(inplace=True)
+            )
+    
+    def forward(self, encoder_feat, decoder_feat):
+        skip_feat = self.align(encoder_feat)
+        skip_feat = self.attention(skip_feat)
+        
+        if self.fusion_type == 'add':
+            return decoder_feat + skip_feat
+        elif self.fusion_type == 'concat':
+            fused = torch.cat([decoder_feat, skip_feat], dim=1)
+            return self.fuse(fused)
+        else:
+            return skip_feat
+
+
+class PositionalEmbedding2D(nn.Module):
+    """2D Learnable Positional Embeddings."""
+    
+    def __init__(self, channels, height, width):
+        super().__init__()
+        self.pos_embed = nn.Parameter(torch.randn(1, channels, height, width) * 0.02)
+        self.channels = channels
+        self.height = height
+        self.width = width
+    
+    def forward(self, x):
+        B, C, H, W = x.shape
+        if H != self.height or W != self.width:
+            pos_embed = F.interpolate(self.pos_embed, size=(H, W), mode='bilinear', align_corners=False)
+        else:
+            pos_embed = self.pos_embed
+        return x + pos_embed
+
+
+class MultiScaleAggregation(nn.Module):
+    """Multi-Scale Feature Aggregation."""
+    
+    def __init__(self, encoder_channels_list, out_channels, target_size=None):
+        super().__init__()
+        self.target_size = target_size
+        
+        self.projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(ch, out_channels, 1, bias=False),
+                get_norm_layer(out_channels, 'group'),
+                nn.ReLU(inplace=True)
+            )
+            for ch in encoder_channels_list
+        ])
+        
+        self.fusion = nn.Sequential(
+            nn.Conv2d(out_channels * len(encoder_channels_list), out_channels, 1, bias=False),
+            get_norm_layer(out_channels, 'group'),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, features_list):
+        if self.target_size is None:
+            self.target_size = features_list[0].shape[2:]
+        
+        projected = []
+        for feat, proj in zip(features_list, self.projections):
+            feat_proj = proj(feat)
+            if feat_proj.shape[2:] != self.target_size:
+                feat_proj = F.interpolate(feat_proj, size=self.target_size, mode='bilinear', align_corners=False)
+            projected.append(feat_proj)
+        
+        concatenated = torch.cat(projected, dim=1)
+        fused = self.fusion(concatenated)
+        return fused
+
+
+class CrossAttentionBottleneck(nn.Module):
+    """Cross-Attention Bottleneck for querying encoder tokens."""
+    
+    def __init__(self, decoder_dim, encoder_dim, num_heads=8, mlp_ratio=4.0, dropout=0.1):
+        super().__init__()
+        self.decoder_dim = decoder_dim
+        self.encoder_dim = encoder_dim
+        
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=decoder_dim,
+            num_heads=num_heads,
+            kdim=encoder_dim,
+            vdim=encoder_dim,
+            dropout=dropout,
+            batch_first=False
+        )
+        
+        self.norm1 = nn.LayerNorm(decoder_dim)
+        self.norm2 = nn.LayerNorm(decoder_dim)
+        
+        mlp_hidden_dim = int(decoder_dim * mlp_ratio)
+        self.ffn = nn.Sequential(
+            nn.Linear(decoder_dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, decoder_dim),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, decoder_feat, encoder_tokens):
+        B, C, H, W = decoder_feat.shape
+        decoder_seq = decoder_feat.flatten(2).permute(2, 0, 1)
+        encoder_seq = encoder_tokens.permute(1, 0, 2)
+        
+        attn_out, _ = self.cross_attn(query=decoder_seq, key=encoder_seq, value=encoder_seq)
+        decoder_seq = self.norm1(decoder_seq + attn_out)
+        ffn_out = self.ffn(decoder_seq)
+        decoder_seq = self.norm2(decoder_seq + ffn_out)
+        
+        output = decoder_seq.permute(1, 2, 0).reshape(B, C, H, W)
+        return output
+
+
+class ImprovedDecoderBlockWithCrossAttn(nn.Module):
+    """Decoder block with cross-attention, multi-scale aggregation, and positional embeddings."""
+    
+    def __init__(self, in_channels, out_channels, encoder_channels_list=None, 
+                 use_cross_attn=False, encoder_dim=None, use_pos_embed=True):
+        super().__init__()
+        self.use_cross_attn = use_cross_attn
+        self.use_pos_embed = use_pos_embed
+        
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            get_norm_layer(out_channels, 'group'),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            get_norm_layer(out_channels, 'group'),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.residual = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+        self.attention = ImprovedCBAM(out_channels)
+        
+        if use_pos_embed:
+            self.pos_embed = None
+        
+        if use_cross_attn and encoder_dim is not None:
+            self.cross_attn = CrossAttentionBottleneck(out_channels, encoder_dim)
+        else:
+            self.cross_attn = None
+        
+        self.dropout = nn.Dropout2d(0.1)
+    
+    def forward(self, x, encoder_tokens=None):
+        identity = x
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = out + self.residual(identity)
+        out = self.attention(out)
+        
+        if self.use_pos_embed:
+            if self.pos_embed is None or self.pos_embed.height != out.shape[2]:
+                self.pos_embed = PositionalEmbedding2D(
+                    out.shape[1], out.shape[2], out.shape[3]
+                ).to(out.device)
+            out = self.pos_embed(out)
+        
+        if self.cross_attn is not None and encoder_tokens is not None:
+            out = self.cross_attn(out, encoder_tokens)
+        
+        out = self.dropout(out)
+        return out
+
+
+class DeepDecoderBlock(nn.Module):
+    """Deep CNN decoder block with residual connections and attention."""
+    
+    def __init__(self, in_channels, out_channels, dropout=0.2):
+        super().__init__()
+        
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            get_norm_layer(out_channels, 'group'),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            get_norm_layer(out_channels, 'group'),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.residual = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+        self.attention = ImprovedCBAM(out_channels)
+        self.pos_embed = None
+        self.dropout = nn.Dropout2d(dropout)
+    
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = out + self.residual(identity)
+        out = self.attention(out)
+        
+        if self.pos_embed is None or self.pos_embed.height != out.shape[2]:
+            self.pos_embed = PositionalEmbedding2D(
+                out.shape[1], out.shape[2], out.shape[3]
+            ).to(out.device)
+        out = self.pos_embed(out)
+        out = self.dropout(out)
+        return out
+
+
+# ============================================================================
+# BASELINE DECODER (Simple EfficientNet-style)
+# ============================================================================
+
+class SimpleSkipConnection(nn.Module):
+    """Simple skip connection: Convert token features to CNN features and concatenate."""
+    
+    def __init__(self, encoder_channels, decoder_channels, use_groupnorm=False):
+        super().__init__()
+        norm_layer = get_norm_layer(decoder_channels, 'group' if use_groupnorm else 'batch')
+        norm_layer_fuse = get_norm_layer(decoder_channels, 'group' if use_groupnorm else 'batch')
+        
+        self.proj = nn.Sequential(
+            nn.Conv2d(encoder_channels, decoder_channels, 1, bias=False),
+            norm_layer,
+            nn.ReLU(inplace=True)
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(decoder_channels * 2, decoder_channels, 3, padding=1, bias=False),
+            norm_layer_fuse,
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, encoder_feat, decoder_feat):
+        encoder_proj = self.proj(encoder_feat)
+        fused = torch.cat([decoder_feat, encoder_proj], dim=1)
+        fused = self.fuse(fused)
+        return fused
+
+
+class SimpleDecoderBlock(nn.Module):
+    """Simple CNN decoder block with BatchNorm (baseline)."""
+    
+    def __init__(self, in_channels, out_channels, use_batchnorm=True):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels) if use_batchnorm else nn.Identity()
+        self.relu1 = nn.ReLU(inplace=True)
+        
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels) if use_batchnorm else nn.Identity()
+        self.relu2 = nn.ReLU(inplace=True)
+    
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu1(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu2(x)
+        return x
+
+
+class BaselineHybrid2Decoder(nn.Module):
+    """
+    Baseline Hybrid2 Decoder:
+    - Swin Bottleneck (2 Swin blocks)
+    - EfficientNet-style CNN decoder
+    - Simple skip connections
+    - BatchNorm (not GroupNorm)
+    - No attention mechanisms (optional via flags)
+    
+    All enhancements can be enabled via flags.
+    """
+    
+    def __init__(self, encoder_channels, num_classes=6, 
+                 efficientnet_variant='b4',
+                 use_deep_supervision=False, use_cbam=False, 
+                 use_smart_skip=False, use_cross_attn=False,
+                 use_multiscale_agg=False, use_groupnorm=False,
+                 use_pos_embed=True,  # Default True to match SwinUnet pattern
+                 use_bottleneck_swin=True,
+                 img_size=224):
+        super().__init__()
+        
+        self.num_classes = num_classes
+        self.encoder_channels = encoder_channels
+        self.efficientnet_variant = efficientnet_variant
+        self.use_deep_supervision = use_deep_supervision
+        self.use_cbam = use_cbam
+        self.use_smart_skip = use_smart_skip
+        self.use_cross_attn = use_cross_attn
+        self.use_multiscale_agg = use_multiscale_agg
+        self.use_groupnorm = use_groupnorm
+        self.use_pos_embed = use_pos_embed
+        self.use_bottleneck_swin = use_bottleneck_swin
+        
+        if efficientnet_variant == 'b0':
+            decoder_channels = [128, 64, 32, 16]
+        elif efficientnet_variant == 'b4':
+            decoder_channels = [256, 128, 64, 32]
+        else:
+            raise ValueError(f"Unsupported EfficientNet variant: {efficientnet_variant}")
+        
+        self.decoder_channels = decoder_channels
+        
+        print("=" * 80)
+        print("🚀 BASELINE Hybrid2 Decoder")
+        print("=" * 80)
+        print(f"  • EfficientNet Variant: {efficientnet_variant}")
+        print(f"  • Decoder Channels: {decoder_channels}")
+        print(f"  • Bottleneck Swin Blocks: {use_bottleneck_swin}")
+        print(f"\n📊 Optional Features:")
+        print(f"  • Deep Supervision: {use_deep_supervision}")
+        print(f"  • CBAM Attention: {use_cbam}")
+        print(f"  • Smart Skip Connections: {use_smart_skip}")
+        print(f"  • Cross-Attention: {use_cross_attn}")
+        print(f"  • Multi-Scale Aggregation: {use_multiscale_agg}")
+        print(f"  • GroupNorm: {use_groupnorm} (else BatchNorm)")
+        print(f"  • Positional Embeddings: {use_pos_embed}")
+        print("=" * 80)
+        
+        # Feature projections
+        self.encoder_projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(enc_ch, dec_ch, 1, bias=False),
+                self._get_norm_layer(dec_ch),
+                nn.ReLU(inplace=True)
+            )
+            for enc_ch, dec_ch in zip(encoder_channels, decoder_channels)
+        ])
+        
+        # Multi-scale aggregation (optional)
+        if use_multiscale_agg:
+            self.multiscale_agg = MultiScaleAggregation(
+                encoder_channels_list=encoder_channels,
+                out_channels=decoder_channels[3],
+                target_size=None
+            )
+        else:
+            self.multiscale_agg = None
+        
+        # Bottleneck: 2 Swin blocks (baseline)
+        if use_bottleneck_swin:
+            bottleneck_resolution = (img_size // 32, img_size // 32)
+            # Choose num_heads based on decoder_channels[3] to ensure divisibility
+            bottleneck_dim = decoder_channels[3]
+            if bottleneck_dim == 256:
+                # 256 is divisible by 8, 16, 32, but not 24
+                bottleneck_num_heads = 16  # 256 / 16 = 16
+            elif bottleneck_dim == 128:
+                # 128 is divisible by 8, 16, but not 24
+                bottleneck_num_heads = 8   # 128 / 8 = 16
+            else:
+                # For other dimensions, try to find a compatible number of heads
+                # Prefer 8, 16, or match encoder stage 4 heads (24) if divisible
+                if bottleneck_dim % 24 == 0:
+                    bottleneck_num_heads = 24
+                elif bottleneck_dim % 16 == 0:
+                    bottleneck_num_heads = 16
+                elif bottleneck_dim % 8 == 0:
+                    bottleneck_num_heads = 8
+                else:
+                    bottleneck_num_heads = 8  # Default fallback
+            
+            self.bottleneck_layer = BasicLayer(
+                dim=bottleneck_dim,
+                input_resolution=bottleneck_resolution,
+                depth=2,
+                num_heads=bottleneck_num_heads,
+                window_size=7,
+                mlp_ratio=4.0,
+                qkv_bias=True,
+                drop_path=0.1,
+                norm_layer=nn.LayerNorm,
+                downsample=None,
+                use_checkpoint=False
+            )
+        else:
+            self.bottleneck_layer = None
+        
+        # Optional: Cross-Attention Bottleneck
+        if use_cross_attn:
+            self.cross_attn = CrossAttentionBottleneck(
+                decoder_dim=decoder_channels[3],
+                encoder_dim=encoder_channels[3],
+                num_heads=8
+            )
+        else:
+            self.cross_attn = None
+        
+        # Optional: CBAM for bottleneck
+        if use_cbam:
+            self.bottleneck_cbam = ImprovedCBAM(decoder_channels[3])
+        else:
+            self.bottleneck_cbam = None
+        
+        # Optional: Positional Embeddings
+        if use_pos_embed:
+            self.pos_embed = PositionalEmbedding2D(
+                decoder_channels[3], img_size // 32, img_size // 32
+            )
+        else:
+            self.pos_embed = None
+        
+        # Decoder stages
+        self.decoder1 = nn.Sequential(
+            self._create_decoder_block(decoder_channels[3], decoder_channels[2]),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        )
+        
+        if use_smart_skip:
+            self.skip1 = ImprovedSmartSkipConnection(
+                encoder_channels=decoder_channels[2],
+                decoder_channels=decoder_channels[2],
+                fusion_type='concat'
+            )
+        else:
+            self.skip1 = SimpleSkipConnection(
+                encoder_channels=decoder_channels[2],
+                decoder_channels=decoder_channels[2],
+                use_groupnorm=use_groupnorm
+            )
+        
+        self.decoder2 = nn.Sequential(
+            self._create_decoder_block(decoder_channels[2], decoder_channels[1]),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        )
+        
+        if use_smart_skip:
+            self.skip2 = ImprovedSmartSkipConnection(
+                encoder_channels=decoder_channels[1],
+                decoder_channels=decoder_channels[1],
+                fusion_type='concat'
+            )
+        else:
+            self.skip2 = SimpleSkipConnection(
+                encoder_channels=decoder_channels[1],
+                decoder_channels=decoder_channels[1],
+                use_groupnorm=use_groupnorm
+            )
+        
+        self.decoder3 = nn.Sequential(
+            self._create_decoder_block(decoder_channels[1], decoder_channels[0]),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        )
+        
+        if use_smart_skip:
+            self.skip3 = ImprovedSmartSkipConnection(
+                encoder_channels=decoder_channels[0],
+                decoder_channels=decoder_channels[0],
+                fusion_type='concat'
+            )
+        else:
+            self.skip3 = SimpleSkipConnection(
+                encoder_channels=decoder_channels[0],
+                decoder_channels=decoder_channels[0],
+                use_groupnorm=use_groupnorm
+            )
+        
+        self.decoder4 = nn.Sequential(
+            nn.Conv2d(decoder_channels[0], 64, 3, padding=1, bias=False),
+            self._get_norm_layer(64),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False)
+        )
+        
+        # Segmentation head
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(64, 64, 3, padding=1, bias=False),
+            self._get_norm_layer(64),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),
+            nn.Conv2d(64, num_classes, 1)
+        )
+        
+        # Auxiliary heads for deep supervision
+        if use_deep_supervision:
+            self.aux_heads = nn.ModuleList([
+                nn.Conv2d(decoder_channels[2], num_classes, 1),
+                nn.Conv2d(decoder_channels[1], num_classes, 1),
+                nn.Conv2d(decoder_channels[0], num_classes, 1),
+            ])
+        else:
+            self.aux_heads = None
+    
+    def _get_norm_layer(self, channels):
+        """Get normalization layer based on flag."""
+        if self.use_groupnorm:
+            return get_norm_layer(channels, 'group')
+        else:
+            return nn.BatchNorm2d(channels)
+    
+    def _create_decoder_block(self, in_channels, out_channels):
+        """Create decoder block with optional CBAM."""
+        block = SimpleDecoderBlock(in_channels, out_channels, 
+                                   use_batchnorm=not self.use_groupnorm)
+        
+        if self.use_cbam:
+            cbam = ImprovedCBAM(out_channels)
+            return nn.Sequential(block, cbam)
+        else:
+            return block
+    
+    def forward(self, encoder_features, encoder_tokens=None):
+        f1, f2, f3, f4 = encoder_features
+        
+        p1 = self.encoder_projections[0](f1)
+        p2 = self.encoder_projections[1](f2)
+        p3 = self.encoder_projections[2](f3)
+        p4 = self.encoder_projections[3](f4)
+        
+        if self.use_multiscale_agg:
+            bottleneck_feat = self.multiscale_agg([f1, f2, f3, f4])
+            if bottleneck_feat.shape[2:] != p4.shape[2:]:
+                bottleneck_feat = F.interpolate(bottleneck_feat, size=p4.shape[2:], 
+                                              mode='bilinear', align_corners=False)
+            x = bottleneck_feat + p4
+        else:
+            x = p4
+        
+        # Bottleneck: 2 Swin blocks (baseline)
+        if self.use_bottleneck_swin:
+            B, C, H, W = x.shape
+            x_tokens = x.flatten(2).permute(0, 2, 1)
+            x_tokens = self.bottleneck_layer(x_tokens)
+            x = x_tokens.permute(0, 2, 1).reshape(B, C, H, W)
+        
+        if self.bottleneck_cbam is not None:
+            x = self.bottleneck_cbam(x)
+        
+        if self.pos_embed is not None:
+            x = self.pos_embed(x)
+        
+        if self.use_cross_attn and encoder_tokens is not None:
+            x = self.cross_attn(x, encoder_tokens)
+        
+        aux_outputs = [] if self.use_deep_supervision else None
+        
+        # Stage 1: H/32 -> H/16
+        x = self.decoder1(x)
+        x = self.skip1(p3, x)
+        if self.use_deep_supervision:
+            aux_out1 = self.aux_heads[0](x)
+            aux_out1 = F.interpolate(aux_out1, scale_factor=16, mode='bilinear', align_corners=False)
+            aux_outputs.append(aux_out1)
+        
+        # Stage 2: H/16 -> H/8
+        x = self.decoder2(x)
+        x = self.skip2(p2, x)
+        if self.use_deep_supervision:
+            aux_out2 = self.aux_heads[1](x)
+            aux_out2 = F.interpolate(aux_out2, scale_factor=8, mode='bilinear', align_corners=False)
+            aux_outputs.append(aux_out2)
+        
+        # Stage 3: H/8 -> H/4
+        x = self.decoder3(x)
+        x = self.skip3(p1, x)
+        if self.use_deep_supervision:
+            aux_out3 = self.aux_heads[2](x)
+            aux_out3 = F.interpolate(aux_out3, scale_factor=4, mode='bilinear', align_corners=False)
+            aux_outputs.append(aux_out3)
+        
+        # Stage 4: H/4 -> H
+        x = self.decoder4(x)
+        main_output = self.seg_head(x)
+        
+        if self.use_deep_supervision:
+            return main_output, aux_outputs
+        else:
+            return main_output
+    
+    def get_model_info(self):
+        """Get model information."""
+        return {
+            'decoder_type': 'BaselineHybrid2',
+            'encoder_channels': self.encoder_channels,
+            'decoder_channels': self.decoder_channels,
+            'num_classes': self.num_classes,
+            'efficientnet_variant': self.efficientnet_variant,
+            'use_deep_supervision': self.use_deep_supervision,
+            'use_cbam': self.use_cbam,
+            'use_smart_skip': self.use_smart_skip,
+            'use_cross_attn': self.use_cross_attn,
+            'use_multiscale_agg': self.use_multiscale_agg,
+            'use_groupnorm': self.use_groupnorm,
+            'use_pos_embed': self.use_pos_embed,
+            'use_bottleneck_swin': self.use_bottleneck_swin,
+            'total_params': sum(p.numel() for p in self.parameters()),
+            'trainable_params': sum(p.numel() for p in self.parameters() if p.requires_grad)
+        }
+
+
+# ============================================================================
+# ENHANCED DECODER (Transformer-CNN Hybrid)
+# ============================================================================
+
+class Hybrid2EnhancedDecoder(nn.Module):
+    """Fully enhanced decoder with transformer-CNN hybrid best practices."""
+    
+    def __init__(self, encoder_channels, num_classes=6, decoder_channels=[256, 128, 64, 32],
+                 use_deep_supervision=True, use_cross_attn=True, use_multiscale_agg=True):
+        super().__init__()
+        
+        self.num_classes = num_classes
+        self.encoder_channels = encoder_channels
+        self.decoder_channels = decoder_channels
+        self.use_deep_supervision = use_deep_supervision
+        self.use_cross_attn = use_cross_attn
+        self.use_multiscale_agg = use_multiscale_agg
+        
+        print("🚀 Hybrid2 Enhanced Decoder Initialized:")
+        print(f"  ✅ GroupNorm (better small-batch stability)")
+        print(f"  ✅ 2D Positional Embeddings (spatial awareness)")
+        print(f"  ✅ Deep Supervision: {use_deep_supervision}")
+        print(f"  ✅ Cross-Attention: {use_cross_attn}")
+        print(f"  ✅ Multi-Scale Aggregation: {use_multiscale_agg}")
+        
+        # Feature projections
+        self.encoder_projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(enc_ch, dec_ch, 1, bias=False),
+                get_norm_layer(dec_ch, 'group'),
+                nn.ReLU(inplace=True)
+            )
+            for enc_ch, dec_ch in zip(encoder_channels, decoder_channels)
+        ])
+        
+        # Multi-scale aggregation (optional)
+        if use_multiscale_agg:
+            self.multiscale_agg = MultiScaleAggregation(
+                encoder_channels_list=encoder_channels,
+                out_channels=decoder_channels[3],
+                target_size=None
+            )
+        
+        # Bottleneck with Cross-Attention
+        self.bottleneck = ImprovedDecoderBlockWithCrossAttn(
+            in_channels=decoder_channels[3],
+            out_channels=decoder_channels[3],
+            use_cross_attn=use_cross_attn,
+            encoder_dim=encoder_channels[3],
+            use_pos_embed=True
+        )
+        
+        # Decoder stages with Smart Skip Connections
+        self.decoder1 = nn.Sequential(
+            ImprovedDecoderBlockWithCrossAttn(
+                in_channels=decoder_channels[3],
+                out_channels=decoder_channels[2],
+                use_cross_attn=False,
+                use_pos_embed=True
+            ),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        )
+        self.skip1 = ImprovedSmartSkipConnection(
+            encoder_channels=decoder_channels[2],
+            decoder_channels=decoder_channels[2],
+            fusion_type='concat'
+        )
+        
+        self.decoder2 = nn.Sequential(
+            ImprovedDecoderBlockWithCrossAttn(
+                in_channels=decoder_channels[2],
+                out_channels=decoder_channels[1],
+                use_cross_attn=False,
+                use_pos_embed=True
+            ),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        )
+        self.skip2 = ImprovedSmartSkipConnection(
+            encoder_channels=decoder_channels[1],
+            decoder_channels=decoder_channels[1],
+            fusion_type='concat'
+        )
+        
+        self.decoder3 = nn.Sequential(
+            ImprovedDecoderBlockWithCrossAttn(
+                in_channels=decoder_channels[1],
+                out_channels=decoder_channels[0],
+                use_cross_attn=False,
+                use_pos_embed=True
+            ),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        )
+        self.skip3 = ImprovedSmartSkipConnection(
+            encoder_channels=decoder_channels[0],
+            decoder_channels=decoder_channels[0],
+            fusion_type='concat'
+        )
+        
+        self.decoder4 = nn.Sequential(
+            nn.Conv2d(decoder_channels[0], 64, 3, padding=1, bias=False),
+            get_norm_layer(64, 'group'),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False)
+        )
+        
+        # Segmentation head
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(64, 64, 3, padding=1, bias=False),
+            get_norm_layer(64, 'group'),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),
+            nn.Conv2d(64, num_classes, 1)
+        )
+        
+        # Auxiliary heads for deep supervision
+        if use_deep_supervision:
+            self.aux_heads = nn.ModuleList([
+                nn.Conv2d(decoder_channels[2], num_classes, 1),
+                nn.Conv2d(decoder_channels[1], num_classes, 1),
+                nn.Conv2d(decoder_channels[0], num_classes, 1),
+            ])
+        
+        print(f"  📊 Encoder channels: {encoder_channels}")
+        print(f"  📊 Decoder channels: {decoder_channels}")
+        print(f"  📊 Output classes: {num_classes}")
+    
+    def forward(self, encoder_features, encoder_tokens=None):
+        f1, f2, f3, f4 = encoder_features
+        
+        p1 = self.encoder_projections[0](f1)
+        p2 = self.encoder_projections[1](f2)
+        p3 = self.encoder_projections[2](f3)
+        p4 = self.encoder_projections[3](f4)
+        
+        if self.use_multiscale_agg:
+            bottleneck_feat = self.multiscale_agg([f1, f2, f3, f4])
+            if bottleneck_feat.shape[2:] != p4.shape[2:]:
+                bottleneck_feat = F.interpolate(bottleneck_feat, size=p4.shape[2:], 
+                                                mode='bilinear', align_corners=False)
+            bottleneck_input = bottleneck_feat + p4
+        else:
+            bottleneck_input = p4
+        
+        x = self.bottleneck(bottleneck_input, encoder_tokens)
+        
+        aux_outputs = [] if self.use_deep_supervision else None
+        
+        # Stage 1: H/32 -> H/16
+        x = self.decoder1(x)
+        x = self.skip1(p3, x)
+        if self.use_deep_supervision:
+            aux_out1 = self.aux_heads[0](x)
+            aux_out1 = F.interpolate(aux_out1, scale_factor=16, mode='bilinear', align_corners=False)
+            aux_outputs.append(aux_out1)
+        
+        # Stage 2: H/16 -> H/8
+        x = self.decoder2(x)
+        x = self.skip2(p2, x)
+        if self.use_deep_supervision:
+            aux_out2 = self.aux_heads[1](x)
+            aux_out2 = F.interpolate(aux_out2, scale_factor=8, mode='bilinear', align_corners=False)
+            aux_outputs.append(aux_out2)
+        
+        # Stage 3: H/8 -> H/4
+        x = self.decoder3(x)
+        x = self.skip3(p1, x)
+        if self.use_deep_supervision:
+            aux_out3 = self.aux_heads[2](x)
+            aux_out3 = F.interpolate(aux_out3, scale_factor=4, mode='bilinear', align_corners=False)
+            aux_outputs.append(aux_out3)
+        
+        # Stage 4: H/4 -> H
+        x = self.decoder4(x)
+        main_output = self.seg_head(x)
+        
+        if self.use_deep_supervision:
+            return main_output, aux_outputs
+        else:
+            return main_output
+    
+    def get_model_info(self):
+        """Get model information."""
+        return {
+            'decoder_type': 'Hybrid2Enhanced',
+            'encoder_channels': self.encoder_channels,
+            'decoder_channels': self.decoder_channels,
+            'num_classes': self.num_classes,
+            'use_deep_supervision': self.use_deep_supervision,
+            'use_cross_attn': self.use_cross_attn,
+            'use_multiscale_agg': self.use_multiscale_agg,
+            'total_params': sum(p.numel() for p in self.parameters()),
+            'trainable_params': sum(p.numel() for p in self.parameters() if p.requires_grad)
+        }
+
+
+class EnhancedEfficientNetDecoder(nn.Module):
+    """
+    Enhanced EfficientNet-style CNN Decoder with transformer-CNN hybrid best practices.
+    Architecture: Pure CNN (Conv + GroupNorm + ReLU) with attention mechanisms
+    """
+    
+    def __init__(self, encoder_channels, num_classes=6, decoder_channels=[256, 128, 64, 32],
+                 use_deep_supervision=True, use_cross_attn=True, use_multiscale_agg=True):
+        super().__init__()
+        
+        self.num_classes = num_classes
+        self.encoder_channels = encoder_channels
+        self.decoder_channels = decoder_channels
+        self.use_deep_supervision = use_deep_supervision
+        self.use_cross_attn = use_cross_attn
+        self.use_multiscale_agg = use_multiscale_agg
+        
+        print("🚀 Enhanced EfficientNet Decoder Initialized:")
+        print(f"  ✅ Pure CNN Architecture (EfficientNet-style)")
+        print(f"  ✅ GroupNorm (better small-batch stability)")
+        print(f"  ✅ CBAM Attention (channel + spatial)")
+        print(f"  ✅ 2D Positional Embeddings")
+        print(f"  ✅ Deep Supervision: {use_deep_supervision}")
+        print(f"  ✅ Cross-Attention: {use_cross_attn}")
+        print(f"  ✅ Multi-Scale Aggregation: {use_multiscale_agg}")
+        
+        # Feature projections
+        self.encoder_projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(enc_ch, dec_ch, 1, bias=False),
+                get_norm_layer(dec_ch, 'group'),
+                nn.ReLU(inplace=True)
+            )
+            for enc_ch, dec_ch in zip(encoder_channels, decoder_channels)
+        ])
+        
+        # Multi-scale aggregation (optional)
+        if use_multiscale_agg:
+            self.multiscale_agg = MultiScaleAggregation(
+                encoder_channels_list=encoder_channels,
+                out_channels=decoder_channels[3],
+                target_size=None
+            )
+        
+        # Bottleneck with Cross-Attention
+        if use_cross_attn:
+            self.bottleneck = ImprovedDecoderBlockWithCrossAttn(
+                in_channels=decoder_channels[3],
+                out_channels=decoder_channels[3],
+                use_cross_attn=True,
+                encoder_dim=encoder_channels[3],
+                use_pos_embed=True
+            )
+        else:
+            self.bottleneck = DeepDecoderBlock(
+                in_channels=decoder_channels[3],
+                out_channels=decoder_channels[3]
+            )
+        
+        # Decoder stages
+        self.decoder1 = nn.Sequential(
+            DeepDecoderBlock(decoder_channels[3], decoder_channels[2]),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        )
+        self.skip1 = ImprovedSmartSkipConnection(
+            encoder_channels=decoder_channels[2],
+            decoder_channels=decoder_channels[2],
+            fusion_type='concat'
+        )
+        
+        self.decoder2 = nn.Sequential(
+            DeepDecoderBlock(decoder_channels[2], decoder_channels[1]),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        )
+        self.skip2 = ImprovedSmartSkipConnection(
+            encoder_channels=decoder_channels[1],
+            decoder_channels=decoder_channels[1],
+            fusion_type='concat'
+        )
+        
+        self.decoder3 = nn.Sequential(
+            DeepDecoderBlock(decoder_channels[1], decoder_channels[0]),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        )
+        self.skip3 = ImprovedSmartSkipConnection(
+            encoder_channels=decoder_channels[0],
+            decoder_channels=decoder_channels[0],
+            fusion_type='concat'
+        )
+        
+        self.decoder4 = nn.Sequential(
+            nn.Conv2d(decoder_channels[0], 64, 3, padding=1, bias=False),
+            get_norm_layer(64, 'group'),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False)
+        )
+        
+        # Segmentation head
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(64, 64, 3, padding=1, bias=False),
+            get_norm_layer(64, 'group'),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),
+            nn.Conv2d(64, num_classes, 1)
+        )
+        
+        # Auxiliary heads for deep supervision
+        if use_deep_supervision:
+            self.aux_heads = nn.ModuleList([
+                nn.Conv2d(decoder_channels[2], num_classes, 1),
+                nn.Conv2d(decoder_channels[1], num_classes, 1),
+                nn.Conv2d(decoder_channels[0], num_classes, 1),
+            ])
+        
+        print(f"  📊 Encoder channels: {encoder_channels}")
+        print(f"  📊 Decoder channels: {decoder_channels}")
+        print(f"  📊 Output classes: {num_classes}")
+    
+    def forward(self, encoder_features, encoder_tokens=None):
+        f1, f2, f3, f4 = encoder_features
+        
+        p1 = self.encoder_projections[0](f1)
+        p2 = self.encoder_projections[1](f2)
+        p3 = self.encoder_projections[2](f3)
+        p4 = self.encoder_projections[3](f4)
+        
+        if self.use_multiscale_agg:
+            bottleneck_feat = self.multiscale_agg([f1, f2, f3, f4])
+            if bottleneck_feat.shape[2:] != p4.shape[2:]:
+                bottleneck_feat = F.interpolate(bottleneck_feat, size=p4.shape[2:], 
+                                                mode='bilinear', align_corners=False)
+            bottleneck_input = bottleneck_feat + p4
+        else:
+            bottleneck_input = p4
+        
+        if self.use_cross_attn and encoder_tokens is not None:
+            x = self.bottleneck(bottleneck_input, encoder_tokens)
+        else:
+            x = self.bottleneck(bottleneck_input)
+        
+        aux_outputs = [] if self.use_deep_supervision else None
+        
+        # Stage 1: H/32 -> H/16
+        x = self.decoder1(x)
+        x = self.skip1(p3, x)
+        if self.use_deep_supervision:
+            aux_out1 = self.aux_heads[0](x)
+            aux_out1 = F.interpolate(aux_out1, scale_factor=16, mode='bilinear', align_corners=False)
+            aux_outputs.append(aux_out1)
+        
+        # Stage 2: H/16 -> H/8
+        x = self.decoder2(x)
+        x = self.skip2(p2, x)
+        if self.use_deep_supervision:
+            aux_out2 = self.aux_heads[1](x)
+            aux_out2 = F.interpolate(aux_out2, scale_factor=8, mode='bilinear', align_corners=False)
+            aux_outputs.append(aux_out2)
+        
+        # Stage 3: H/8 -> H/4
+        x = self.decoder3(x)
+        x = self.skip3(p1, x)
+        if self.use_deep_supervision:
+            aux_out3 = self.aux_heads[2](x)
+            aux_out3 = F.interpolate(aux_out3, scale_factor=4, mode='bilinear', align_corners=False)
+            aux_outputs.append(aux_out3)
+        
+        # Stage 4: H/4 -> H
+        x = self.decoder4(x)
+        main_output = self.seg_head(x)
+        
+        if self.use_deep_supervision:
+            return main_output, aux_outputs
+        else:
+            return main_output
+    
+    def get_model_info(self):
+        """Get model information."""
+        return {
+            'decoder_type': 'EnhancedEfficientNet',
+            'encoder_channels': self.encoder_channels,
+            'decoder_channels': self.decoder_channels,
+            'num_classes': self.num_classes,
+            'use_deep_supervision': self.use_deep_supervision,
+            'use_cross_attn': self.use_cross_attn,
+            'use_multiscale_agg': self.use_multiscale_agg,
+            'total_params': sum(p.numel() for p in self.parameters()),
+            'trainable_params': sum(p.numel() for p in self.parameters() if p.requires_grad)
+        }
+
+
+# ============================================================================
+# FACTORY FUNCTIONS FOR DECODERS
+# ============================================================================
+
+def create_hybrid2_enhanced_decoder(encoder_channels, num_classes=6, 
+                                      use_deep_supervision=True, 
+                                      use_cross_attn=True,
+                                      use_multiscale_agg=True):
+    """Factory function to create Hybrid2 enhanced decoder."""
+    return Hybrid2EnhancedDecoder(
+        encoder_channels=encoder_channels,
+        num_classes=num_classes,
+        decoder_channels=[256, 128, 64, 32],
+        use_deep_supervision=use_deep_supervision,
+        use_cross_attn=use_cross_attn,
+        use_multiscale_agg=use_multiscale_agg
+    )
+
+
+def create_enhanced_efficientnet_decoder(encoder_channels, num_classes=6,
+                                         use_deep_supervision=True,
+                                         use_cross_attn=True,
+                                         use_multiscale_agg=True):
+    """Factory function to create Enhanced EfficientNet Decoder."""
+    return EnhancedEfficientNetDecoder(
+        encoder_channels=encoder_channels,
+        num_classes=num_classes,
+        decoder_channels=[256, 128, 64, 32],
+        use_deep_supervision=use_deep_supervision,
+        use_cross_attn=use_cross_attn,
+        use_multiscale_agg=use_multiscale_agg
+    )
+

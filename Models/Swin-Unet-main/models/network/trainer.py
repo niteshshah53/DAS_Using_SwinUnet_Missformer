@@ -1150,7 +1150,7 @@ def trainer_synapse(args, model, snapshot_path, train_dataset=None, val_dataset=
         
         # Save periodic checkpoint (every 10 epochs) - useful for recovery and evaluation
         # Sometimes the best model by loss isn't best by Dice/IoU
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 100 == 0:
             periodic_checkpoint_path = os.path.join(snapshot_path, f"epoch_{epoch + 1}.pth")
             model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
             periodic_checkpoint = {

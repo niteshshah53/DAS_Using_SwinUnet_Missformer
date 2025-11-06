@@ -51,7 +51,7 @@ def get_model(args, config=None):
         
         if use_enhanced:
             print("=" * 80)
-            print("🚀 Loading Hybrid1 Enhanced: EfficientNet-B4 + Swin-Unet with TransUNet Best Practices")
+            print("🚀 Loading Hybrid1 Enhanced: EfficientNet-B4 + Swin-Unet with Transformer-CNN Hybrid Best Practices")
             print("=" * 80)
             from hybrid1.hybrid_model import create_hybrid_model
             model = create_hybrid_model(
@@ -72,36 +72,56 @@ def get_model(args, config=None):
             )
     elif args.model == 'hybrid2':
         # Check which decoder variant to use
+        use_baseline = getattr(args, 'use_baseline', False)
         use_transunet = getattr(args, 'use_transunet', False)
         use_efficientnet = getattr(args, 'use_efficientnet', False)
         
-        if use_efficientnet:
+        if use_baseline:
             print("=" * 80)
-            print("🚀 Loading Hybrid2-Enhanced EfficientNet: CNN Decoder + TransUNet")
+            print("🚀 Loading Hybrid2 BASELINE")
             print("=" * 80)
-            from hybrid2.hybrid_model_transunet import create_hybrid2_efficientnet
+            from hybrid2.model import create_hybrid2_baseline
+            model = create_hybrid2_baseline(
+                num_classes=args.num_classes,
+                img_size=args.img_size,
+                efficientnet_variant=getattr(args, 'efficientnet_variant', 'b4'),
+                use_deep_supervision=getattr(args, 'use_deep_supervision', False),
+                use_cbam=getattr(args, 'use_cbam', False),
+                use_smart_skip=getattr(args, 'use_smart_skip', False),
+                use_cross_attn=getattr(args, 'use_cross_attn', False),
+                use_multiscale_agg=getattr(args, 'use_multiscale_agg', False),
+                use_groupnorm=getattr(args, 'use_groupnorm', False),
+                use_pos_embed=getattr(args, 'use_pos_embed', True)  # Default True to match SwinUnet
+            )
+        elif use_efficientnet:
+            print("=" * 80)
+            print("🚀 Loading Hybrid2-Enhanced EfficientNet: CNN Decoder + Transformer-CNN Hybrid")
+            print("=" * 80)
+            from hybrid2.model import create_hybrid2_efficientnet
             model = create_hybrid2_efficientnet(
                 num_classes=args.num_classes,
                 img_size=args.img_size
             )
         elif use_transunet:
             print("=" * 80)
-            print("🚀 Loading Hybrid2-TransUNet: FULL TransUNet Best Practices")
+            print("🚀 Loading Hybrid2 Enhanced: Transformer-CNN Hybrid Best Practices")
             print("=" * 80)
-            from hybrid2.hybrid_model_transunet import create_hybrid2_transunet_full
-            model = create_hybrid2_transunet_full(
+            from hybrid2.model import create_hybrid2_enhanced_full
+            model = create_hybrid2_enhanced_full(
                 num_classes=args.num_classes,
                 img_size=args.img_size
             )
         else:
             print("Loading Hybrid2: Swin-EfficientNet model...")
-            print("🚀 TransUNet Best Practices: Deep Supervision ENABLED")
-            from hybrid2.hybrid_model import create_hybrid2_model
-            model = create_hybrid2_model(
+            print("🚀 Transformer-CNN Hybrid Best Practices: Deep Supervision ENABLED")
+            # Fallback to baseline if hybrid_model doesn't exist
+            from hybrid2.model import create_hybrid2_baseline
+            model = create_hybrid2_baseline(
                 num_classes=args.num_classes,
                 img_size=args.img_size,
                 efficientnet_variant=getattr(args, 'efficientnet_variant', 'b4'),
-                use_deep_supervision=True  # TransUNet best practice
+                use_deep_supervision=True,  # Transformer-CNN hybrid best practice
+                # Note: use_pos_embed defaults to True (matching SwinUnet pattern)
             )
     else:
         raise ValueError(f"Unknown model: {args.model}. Use 'hybrid1' or 'hybrid2'")
@@ -224,16 +244,40 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='Hybrid Model Training for Historical Document Segmentation')
     
     # Model configuration
-    parser.add_argument('--model', type=str, default='hybrid1', choices=['hybrid1', 'hybrid2'],
+    parser.add_argument('--model', type=str, default='hybrid2', choices=['hybrid1', 'hybrid2'],
                        help='Model type: hybrid1 (EfficientNet-Swin) or hybrid2 (Swin-EfficientNet)')
-    parser.add_argument('--efficientnet_variant', type=str, default='b4', choices=['b0', 'b4', 'b5'],
-                       help='EfficientNet variant for hybrid2 decoder (b0, b4, b5)')
+    parser.add_argument('--efficientnet_variant', type=str, default='b4', choices=['b0', 'b4'],
+                       help='EfficientNet variant for hybrid2 baseline decoder (b0, b4)')
+    
+    # Hybrid2 model variants
+    parser.add_argument('--use_baseline', action='store_true', default=False,
+                       help='Use baseline Hybrid2 (Swin encoder + 2 Swin blocks bottleneck + EfficientNet decoder)')
     parser.add_argument('--use_transunet', action='store_true', default=False,
-                       help='Use TransUNet-enhanced Hybrid2 (all best practices: GroupNorm, PosEmbed, CrossAttn, MultiScale)')
+                       help='Use Enhanced Hybrid2 decoder (all best practices: GroupNorm, PosEmbed, CrossAttn, MultiScale)')
     parser.add_argument('--use_efficientnet', action='store_true', default=False,
-                       help='Use Enhanced EfficientNet decoder (Pure CNN + TransUNet improvements, Expected IoU: 0.60-0.65)')
+                       help='Use Enhanced EfficientNet decoder (Pure CNN + transformer-CNN hybrid improvements, Expected IoU: 0.60-0.65)')
+    
+    # Hybrid1 enhancement
     parser.add_argument('--use_enhanced', action='store_true', default=False,
-                       help='Use Enhanced Hybrid1 with TransUNet best practices (Deep Supervision + Multi-scale Aggregation)')
+                       help='Use Enhanced Hybrid1 with transformer-CNN hybrid best practices (Deep Supervision + Multi-scale Aggregation)')
+    
+    # Hybrid2 baseline enhancement flags (only used with --use_baseline)
+    parser.add_argument('--use_deep_supervision', action='store_true', default=False,
+                       help='Enable deep supervision (auxiliary outputs)')
+    parser.add_argument('--use_cbam', action='store_true', default=False,
+                       help='Enable CBAM attention modules')
+    parser.add_argument('--use_smart_skip', action='store_true', default=False,
+                       help='Use smart skip connections (attention-based) instead of simple concatenation')
+    parser.add_argument('--use_cross_attn', action='store_true', default=False,
+                       help='Enable cross-attention bottleneck')
+    parser.add_argument('--use_multiscale_agg', action='store_true', default=False,
+                       help='Enable multi-scale aggregation')
+    parser.add_argument('--use_groupnorm', action='store_true', default=False,
+                       help='Use GroupNorm instead of BatchNorm')
+    parser.add_argument('--use_pos_embed', action='store_true', default=True,
+                       help='Enable positional embeddings (default: True, matching SwinUnet pattern)')
+    parser.add_argument('--no_pos_embed', dest='use_pos_embed', action='store_false',
+                       help='Disable positional embeddings')
     parser.add_argument('--img_size', type=int, default=224, help='Input image size')
     parser.add_argument('--num_classes', type=int, default=5, help='Number of classes')
     

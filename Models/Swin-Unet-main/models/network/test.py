@@ -104,6 +104,14 @@ Examples:
     parser.add_argument('--test_save_dir', type=str, default='../predictions',
                        help='Directory to save prediction results')
     
+    # Test-time augmentation
+    parser.add_argument('--use_tta', action='store_true', default=False,
+                       help='Enable test-time augmentation: predict on augmented versions (original, hflip, vflip, rot90) and average')
+    
+    # CRF post-processing
+    parser.add_argument('--use_crf', action='store_true', default=False,
+                       help='Enable CRF post-processing: refine predictions using DenseCRF for spatial coherence')
+    
     # System configuration
     parser.add_argument('--deterministic', type=int, default=1,
                        help='Use deterministic testing')
@@ -518,7 +526,181 @@ def estimate_image_dimensions(original_name, original_img_dir, patches, patch_po
     return max_x, max_y, patches_per_row
 
 
-def stitch_patches(patches, patch_positions, max_x, max_y, patches_per_row, patch_size, model):
+def predict_patch_with_tta(patch_tensor, model, return_probs=False):
+    """
+    Predict patch with test-time augmentation.
+    
+    Applies augmentations (original, horizontal flip, vertical flip, rotation 90°),
+    gets predictions for each, reverses augmentations, and averages probabilities.
+    
+    Args:
+        patch_tensor: Input patch tensor [1, 3, H, W]
+        model: Neural network model
+        return_probs: If True, return averaged probabilities instead of argmax prediction
+        
+    Returns:
+        numpy.ndarray: Averaged prediction map [H, W] or probabilities [C, H, W]
+    """
+    import torchvision.transforms.functional as TF
+    
+    device = patch_tensor.device
+    augmented_outputs = []
+    
+    # 1. Original (no augmentation)
+    with torch.no_grad():
+        output = model(patch_tensor)
+        if isinstance(output, tuple):
+            output = output[0]  # Use main output for inference
+        # Apply softmax to get probabilities
+        probs = torch.softmax(output, dim=1)
+        augmented_outputs.append(probs)
+    
+    # 2. Horizontal flip
+    patch_hflip = TF.hflip(patch_tensor.squeeze(0)).unsqueeze(0)
+    with torch.no_grad():
+        output = model(patch_hflip.to(device))
+        if isinstance(output, tuple):
+            output = output[0]
+        probs = torch.softmax(output, dim=1)
+        # Reverse horizontal flip on probabilities
+        probs_reversed = TF.hflip(probs.squeeze(0)).unsqueeze(0)
+        augmented_outputs.append(probs_reversed)
+    
+    # 3. Vertical flip
+    patch_vflip = TF.vflip(patch_tensor.squeeze(0)).unsqueeze(0)
+    with torch.no_grad():
+        output = model(patch_vflip.to(device))
+        if isinstance(output, tuple):
+            output = output[0]
+        probs = torch.softmax(output, dim=1)
+        # Reverse vertical flip on probabilities
+        probs_reversed = TF.vflip(probs.squeeze(0)).unsqueeze(0)
+        augmented_outputs.append(probs_reversed)
+    
+    # 4. Rotation 90°
+    patch_rot90 = TF.rotate(patch_tensor.squeeze(0), angle=-90).unsqueeze(0)
+    with torch.no_grad():
+        output = model(patch_rot90.to(device))
+        if isinstance(output, tuple):
+            output = output[0]
+        probs = torch.softmax(output, dim=1)
+        # Reverse rotation 90° (rotate back by +90°)
+        probs_reversed = TF.rotate(probs.squeeze(0), angle=90).unsqueeze(0)
+        augmented_outputs.append(probs_reversed)
+    
+    # Average all probabilities (all tensors are on the same device)
+    averaged_probs = torch.stack(augmented_outputs).mean(dim=0)
+    
+    if return_probs:
+        # Return probabilities [C, H, W]
+        return averaged_probs.squeeze(0).cpu().numpy()
+    else:
+        # Take argmax to get final prediction
+        pred_patch = torch.argmax(averaged_probs, dim=1).squeeze(0).cpu().numpy()
+        return pred_patch
+
+
+def apply_crf_postprocessing(prob_map, rgb_image, num_classes=6, 
+                              spatial_weight=3.0, spatial_x_stddev=3.0, spatial_y_stddev=3.0,
+                              color_weight=10.0, color_stddev=50.0,
+                              num_iterations=10):
+    """
+    Apply DenseCRF post-processing to refine segmentation predictions.
+    
+    Args:
+        prob_map: Probability map [H, W, C] with class probabilities
+        rgb_image: Original RGB image [H, W, 3] for pairwise potentials
+        num_classes: Number of segmentation classes
+        spatial_weight: Weight for spatial pairwise potentials
+        spatial_x_stddev: Standard deviation for spatial x dimension
+        spatial_y_stddev: Standard deviation for spatial y dimension
+        color_weight: Weight for color pairwise potentials
+        color_stddev: Standard deviation for color similarity
+        num_iterations: Number of CRF iterations
+        
+    Returns:
+        numpy.ndarray: Refined prediction map [H, W] with class indices
+    """
+    try:
+        # pydensecrf2 package installs as 'pydensecrf' module
+        try:
+            import pydensecrf2.densecrf as dcrf
+            from pydensecrf2.utils import unary_from_softmax, create_pairwise_bilateral, create_pairwise_gaussian
+        except ImportError:
+            # Fallback: try importing as pydensecrf (actual module name)
+            import pydensecrf.densecrf as dcrf
+            from pydensecrf.utils import unary_from_softmax, create_pairwise_bilateral, create_pairwise_gaussian
+    except ImportError:
+        error_msg = (
+            "pydensecrf2 is not installed. CRF post-processing requires this package.\n"
+            "Installation options:\n"
+            "  1. pip install pydensecrf2\n"
+            "  2. conda install -c conda-forge pydensecrf2\n"
+            "  3. python3 -m pip install pydensecrf2\n"
+            "Note: The package installs as 'pydensecrf' module even though pip package is 'pydensecrf2'.\n"
+            "Note: If using conda and encountering symbol errors, try: conda install libgcc"
+        )
+        logging.error(error_msg)
+        raise ImportError("pydensecrf2 is required for CRF post-processing")
+    
+    H, W = prob_map.shape[:2]
+    
+    # Ensure probabilities are in correct format and range
+    if prob_map.shape[2] != num_classes:
+        raise ValueError(f"Probability map has {prob_map.shape[2]} classes but expected {num_classes}")
+    
+    # Ensure prob_map is C-contiguous (required by pydensecrf)
+    prob_map = np.ascontiguousarray(prob_map, dtype=np.float32)
+    
+    # Resize RGB image if dimensions don't match
+    if rgb_image.shape[:2] != (H, W):
+        rgb_image_resized = np.array(Image.fromarray(rgb_image).resize((W, H), Image.BILINEAR))
+    else:
+        rgb_image_resized = rgb_image.copy()
+    
+    # Ensure RGB image is uint8 and C-contiguous (required by pydensecrf)
+    if rgb_image_resized.dtype != np.uint8:
+        rgb_image_resized = np.clip(rgb_image_resized, 0, 255).astype(np.uint8)
+    rgb_image_resized = np.ascontiguousarray(rgb_image_resized, dtype=np.uint8)
+    
+    # Transpose probability map to [C, H, W] format for DenseCRF
+    prob_map_transposed = prob_map.transpose(2, 0, 1)  # [C, H, W]
+    # Ensure transposed array is C-contiguous (required by pydensecrf)
+    prob_map_transposed = np.ascontiguousarray(prob_map_transposed, dtype=np.float32)
+    
+    # Create CRF model
+    crf = dcrf.DenseCRF2D(W, H, num_classes)
+    
+    # Set unary potentials (negative log probabilities)
+    unary = unary_from_softmax(prob_map_transposed)
+    crf.setUnaryEnergy(unary)
+    
+    # Add pairwise potentials
+    
+    # 1. Spatial pairwise potential (encourages nearby pixels to have same label)
+    pairwise_gaussian = create_pairwise_gaussian(sdims=(spatial_y_stddev, spatial_x_stddev), shape=(H, W))
+    crf.addPairwiseEnergy(pairwise_gaussian, compat=spatial_weight)
+    
+    # 2. Bilateral pairwise potential (encourages similar colored pixels to have same label)
+    pairwise_bilateral = create_pairwise_bilateral(
+        sdims=(spatial_y_stddev, spatial_x_stddev),
+        schan=(color_stddev, color_stddev, color_stddev),
+        img=rgb_image_resized,
+        chdim=2
+    )
+    crf.addPairwiseEnergy(pairwise_bilateral, compat=color_weight)
+    
+    # Run inference
+    Q = crf.inference(num_iterations)
+    
+    # Get refined probabilities and convert to prediction
+    refined_probs = np.array(Q).reshape((num_classes, H, W)).transpose(1, 2, 0)
+    refined_pred = np.argmax(refined_probs, axis=2).astype(np.uint8)
+    
+    return refined_pred
+
+
+def stitch_patches(patches, patch_positions, max_x, max_y, patches_per_row, patch_size, model, use_tta=False, return_probs=False):
     """
     Stitch together patch predictions into full image.
     
@@ -529,14 +711,22 @@ def stitch_patches(patches, patch_positions, max_x, max_y, patches_per_row, patc
         patches_per_row (int): Number of patches per row
         patch_size (int): Size of each patch
         model: Neural network model
+        use_tta (bool): Whether to use test-time augmentation
+        return_probs (bool): If True, also return softmax probabilities (needed for CRF)
         
     Returns:
         numpy.ndarray: Stitched prediction map
+        Optional[numpy.ndarray]: Stitched probability map [H, W, C] if return_probs=True
     """
     import torchvision.transforms.functional as TF
     
     pred_full = np.zeros((max_y, max_x), dtype=np.int32)
     count_map = np.zeros((max_y, max_x), dtype=np.int32)
+    
+    if return_probs:
+        # Initialize probability map (will be accumulated)
+        num_classes = None
+        prob_full = None
     
     for patch_path in patches:
         patch_id = patch_positions[patch_path]
@@ -549,20 +739,42 @@ def stitch_patches(patches, patch_positions, max_x, max_y, patches_per_row, patc
         patch = Image.open(patch_path).convert("RGB")
         patch_tensor = TF.to_tensor(patch).unsqueeze(0).cuda()
         
-        with torch.no_grad():
-            output = model(patch_tensor)
-            
-            # Handle deep supervision output (tuple) vs regular output (tensor)
-            if isinstance(output, tuple):
-                # Deep supervision: output is (main_logits, aux_outputs)
-                output = output[0]  # Use main output for inference
-            
-            pred_patch = torch.argmax(output, dim=1).cpu().numpy()[0]
+        # Use TTA if enabled, otherwise use standard prediction
+        if use_tta:
+            if return_probs:
+                # Get averaged probabilities from TTA
+                probs = predict_patch_with_tta(patch_tensor, model, return_probs=True)  # [C, H, W]
+                if prob_full is None:
+                    num_classes = probs.shape[0]
+                    prob_full = np.zeros((max_y, max_x, num_classes), dtype=np.float32)
+                pred_patch = np.argmax(probs, axis=0)  # [H, W]
+            else:
+                pred_patch = predict_patch_with_tta(patch_tensor, model, return_probs=False)
+        else:
+            with torch.no_grad():
+                output = model(patch_tensor)
+                
+                # Handle deep supervision output (tuple) vs regular output (tensor)
+                if isinstance(output, tuple):
+                    # Deep supervision: output is (main_logits, aux_outputs)
+                    output = output[0]  # Use main output for inference
+                
+                if return_probs:
+                    probs = torch.softmax(output, dim=1).cpu().numpy()[0]  # [C, H, W]
+                    if prob_full is None:
+                        num_classes = probs.shape[0]
+                        prob_full = np.zeros((max_y, max_x, num_classes), dtype=np.float32)
+                
+                pred_patch = torch.argmax(output, dim=1).cpu().numpy()[0]
         
         # Add to prediction map with boundary checking
         if y + patch_size <= pred_full.shape[0] and x + patch_size <= pred_full.shape[1]:
             pred_full[y:y+patch_size, x:x+patch_size] += pred_patch
             count_map[y:y+patch_size, x:x+patch_size] += 1
+            if return_probs:
+                # Convert probabilities from [C, H, W] to [H, W, C] format
+                # probs is always [C, H, W] format from model output
+                prob_full[y:y+patch_size, x:x+patch_size, :] += probs.transpose(1, 2, 0)
         else:
             # Handle edge cases
             valid_h = min(patch_size, pred_full.shape[0] - y)
@@ -570,10 +782,19 @@ def stitch_patches(patches, patch_positions, max_x, max_y, patches_per_row, patc
             if valid_h > 0 and valid_w > 0:
                 pred_full[y:y+valid_h, x:x+valid_w] += pred_patch[:valid_h, :valid_w]
                 count_map[y:y+valid_h, x:x+valid_w] += 1
+                if return_probs:
+                    # probs is [C, H, W], slice and transpose to [H, W, C]
+                    prob_full[y:y+valid_h, x:x+valid_w, :] += probs[:, :valid_h, :valid_w].transpose(1, 2, 0)
     
     # Normalize by count map
     pred_full = np.round(pred_full / np.maximum(count_map, 1)).astype(np.uint8)
-    return pred_full
+    
+    if return_probs:
+        # Normalize probabilities by count map
+        prob_full = prob_full / np.maximum(count_map[:, :, np.newaxis], 1)
+        return pred_full, prob_full
+    else:
+        return pred_full
 
 
 def save_prediction_results(pred_full, original_name, class_colors, result_dir):
@@ -752,10 +973,57 @@ def inference(args, model, test_save_path=None):
         )
         
         # Stitch patches together
-        pred_full = stitch_patches(
-            patches, patch_positions, max_x, max_y, 
-            patches_per_row, patch_size, model
-        )
+        use_tta = getattr(args, 'use_tta', False)
+        use_crf = getattr(args, 'use_crf', False)
+        
+        if use_crf:
+            # Get both predictions and probabilities for CRF
+            pred_full, prob_full = stitch_patches(
+                patches, patch_positions, max_x, max_y, 
+                patches_per_row, patch_size, model, use_tta=use_tta, return_probs=True
+            )
+            
+            # Load original RGB image for CRF pairwise potentials
+            orig_img_rgb = None
+            for ext in ['.jpg', '.png', '.tif', '.tiff']:
+                orig_path = os.path.join(original_img_dir, f"{original_name}{ext}")
+                if os.path.exists(orig_path):
+                    orig_img_pil = Image.open(orig_path).convert("RGB")
+                    # Resize to match prediction dimensions
+                    if orig_img_pil.size != (max_x, max_y):
+                        orig_img_pil = orig_img_pil.resize((max_x, max_y), Image.BILINEAR)
+                    orig_img_rgb = np.array(orig_img_pil)
+                    break
+            
+            if orig_img_rgb is not None:
+                logging.info(f"Applying CRF post-processing to {original_name}")
+                try:
+                    # Apply CRF refinement
+                    pred_full = apply_crf_postprocessing(
+                        prob_full, orig_img_rgb, 
+                        num_classes=n_classes,
+                        spatial_weight=3.0,
+                        spatial_x_stddev=3.0,
+                        spatial_y_stddev=3.0,
+                        color_weight=10.0,
+                        color_stddev=50.0,
+                        num_iterations=10
+                    )
+                    logging.info(f"CRF post-processing completed for {original_name}")
+                except Exception as e:
+                    logging.warning(f"CRF post-processing failed for {original_name}: {e}")
+                    logging.warning("Falling back to non-CRF predictions")
+                    # Fall back to argmax if CRF fails
+                    pred_full = np.argmax(prob_full, axis=2).astype(np.uint8)
+            else:
+                logging.warning(f"Original image not found for CRF: {original_name}, using non-CRF predictions")
+                pred_full = np.argmax(prob_full, axis=2).astype(np.uint8)
+        else:
+            # Standard inference without CRF
+            pred_full = stitch_patches(
+                patches, patch_positions, max_x, max_y, 
+                patches_per_row, patch_size, model, use_tta=use_tta, return_probs=False
+            )
         
         # Save prediction results
         save_prediction_results(pred_full, original_name, class_colors, result_dir)
@@ -858,6 +1126,12 @@ def main():
     print(f"Model: CNN-Transformer")
     print(f"Manuscript: {args.manuscript}")
     print(f"Save predictions: {args.is_savenii}")
+    print(f"Test-time augmentation: {'Enabled' if args.use_tta else 'Disabled'}")
+    if args.use_tta:
+        print("  - Augmentations: Original, Horizontal flip, Vertical flip, Rotation 90°")
+    print(f"CRF post-processing: {'Enabled' if args.use_crf else 'Disabled'}")
+    if args.use_crf:
+        print("  - DenseCRF with spatial and color pairwise potentials")
     print()
     
     try:

@@ -19,6 +19,9 @@ module load cudnn
 
 conda activate pytorch2.6-py3.12
 
+# Add user site-packages to PYTHONPATH to find user-installed packages like pydensecrf2
+export PYTHONPATH="${HOME}/.local/lib/python3.12/site-packages:${PYTHONPATH}"
+
 # ============================================================================
 # ABLATION CONFIGURATION
 # ============================================================================
@@ -89,7 +92,7 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --batch_size 4 \
         --max_epochs 300 \
         --base_lr 0.0001 \
-        --patience 100 \
+        --patience 50 \
         --output_dir "./a4/${MANUSCRIPT}"
     
     TRAIN_EXIT_CODE=$?
@@ -120,6 +123,8 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
             --use_multiscale_agg \
             --freeze_encoder \
             --is_savenii \
+            --use_tta \
+            --use_crf \
             --output_dir "./a4/${MANUSCRIPT}"
         
         TEST_EXIT_CODE=$?

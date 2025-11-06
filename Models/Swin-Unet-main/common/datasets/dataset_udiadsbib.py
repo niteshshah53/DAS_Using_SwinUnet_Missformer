@@ -176,12 +176,39 @@ def rgb_to_class(mask, num_classes=6):
     # Choose appropriate color map based on number of classes
     if num_classes == 5:
         color_map = COLOR_MAP_5_CLASSES
+        # For 5-class mode, explicitly handle Chapter Headings pixels
+        # Map them to Background (0) since they don't exist in Syr341FS
+        chapter_headings_color = (0, 255, 0)
     else:  # Default to 6 classes
         color_map = COLOR_MAP_6_CLASSES
+        chapter_headings_color = None
+    
+    # Track which pixels have been mapped
+    mapped_mask = np.zeros(mask.shape[:2], dtype=bool)
     
     for rgb, cls in color_map.items():
         matches = np.all(mask == rgb, axis=-1)
         mask_class[matches] = cls
+        mapped_mask[matches] = True
+    
+    # For 5-class mode: explicitly map Chapter Headings to Background
+    if num_classes == 5 and chapter_headings_color is not None:
+        chapter_matches = np.all(mask == chapter_headings_color, axis=-1)
+        mask_class[chapter_matches] = 0  # Map to Background
+        mapped_mask[chapter_matches] = True
+    
+    # Check for unmapped pixels and warn if found (only warn once per call)
+    unmapped_pixels = ~mapped_mask
+    if np.any(unmapped_pixels):
+        unique_colors = np.unique(mask[unmapped_pixels].reshape(-1, 3), axis=0)
+        # Only print warning if significant number of unmapped pixels (>0.1% of image)
+        unmapped_ratio = np.sum(unmapped_pixels) / mask.size
+        if unmapped_ratio > 0.001:  # More than 0.1% unmapped
+            print(f"⚠️  WARNING: Found {np.sum(unmapped_pixels)} unmapped pixels ({unmapped_ratio*100:.2f}%)!")
+            print(f"   Unique unmapped colors: {unique_colors.tolist()}")
+            print(f"   Mapping them to Background (class 0)")
+        mask_class[unmapped_pixels] = 0
+    
     return mask_class
 
 
@@ -280,6 +307,29 @@ class UDiadsBibDataset(Dataset):
         if not os.path.exists(img_dir) or not os.path.exists(mask_dir):
             if multiprocessing.current_process().name == 'MainProcess':
                 print(f"Warning: One of the directories does not exist!")
+                # Check what directories actually exist to help debug
+                if self.manuscript:
+                    manuscript_dir = os.path.join(self.root_dir, self.manuscript)
+                    if os.path.exists(manuscript_dir):
+                        print(f"Available directories in {manuscript_dir}:")
+                        for item in sorted(os.listdir(manuscript_dir)):
+                            item_path = os.path.join(manuscript_dir, item)
+                            if os.path.isdir(item_path):
+                                subdirs = [d for d in os.listdir(item_path) if os.path.isdir(os.path.join(item_path, d))]
+                                print(f"  {item}/: {', '.join(subdirs) if subdirs else '(empty)'}")
+                    else:
+                        print(f"Manuscript directory does not exist: {manuscript_dir}")
+                        print(f"Available manuscripts in {self.root_dir}:")
+                        if os.path.exists(self.root_dir):
+                            manuscripts = [d for d in os.listdir(self.root_dir) if os.path.isdir(os.path.join(self.root_dir, d))]
+                            print(f"  {', '.join(sorted(manuscripts)) if manuscripts else '(none found)'}")
+                else:
+                    if os.path.exists(self.root_dir):
+                        print(f"Available directories in {self.root_dir}:")
+                        for item in sorted(os.listdir(self.root_dir)):
+                            item_path = os.path.join(self.root_dir, item)
+                            if os.path.isdir(item_path):
+                                print(f"  {item}/")
             return [], []
             
         # Get all patch images
@@ -302,8 +352,20 @@ class UDiadsBibDataset(Dataset):
         
         if multiprocessing.current_process().name == 'MainProcess':
             print(f"Successfully matched {len(img_paths)} image-mask pairs")
-        return img_paths, mask_paths
-            
+            if len(img_paths) == 0:
+                print(f"ERROR: No image-mask pairs found!")
+                print(f"  Image directory exists: {os.path.exists(img_dir)}")
+                print(f"  Mask directory exists: {os.path.exists(mask_dir)}")
+                if os.path.exists(img_dir):
+                    img_files = glob.glob(os.path.join(img_dir, '*.png'))
+                    print(f"  Image files found: {len(img_files)}")
+                    if len(img_files) > 0:
+                        print(f"  Example image file: {os.path.basename(img_files[0])}")
+                if os.path.exists(mask_dir):
+                    mask_files = glob.glob(os.path.join(mask_dir, '*.png'))
+                    print(f"  Mask files found: {len(mask_files)}")
+                    if len(mask_files) > 0:
+                        print(f"  Example mask file: {os.path.basename(mask_files[0])}")
         return img_paths, mask_paths
 
     def _prepare_patches(self):

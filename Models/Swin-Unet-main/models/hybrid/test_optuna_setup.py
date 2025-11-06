@@ -101,7 +101,8 @@ for module_name in required_modules:
 print("\n7. Checking model files...")
 model_files = [
     'hybrid1/hybrid_model.py',
-    'hybrid2/hybrid_model.py',
+    'hybrid2/model.py',  # Main model classes and factory functions
+    'hybrid2/components.py',  # All building blocks (encoder, decoders, improvements)
     'trainer.py',
     'trainer_optuna.py',
     'optuna_tune.py'

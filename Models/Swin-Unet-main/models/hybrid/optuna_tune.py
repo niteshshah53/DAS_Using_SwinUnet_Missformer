@@ -70,8 +70,8 @@ def get_model(model_type, num_classes, img_size, use_enhanced=False):
             )
     elif model_type == 'hybrid2':
         print(f"[Trial] Loading Hybrid2: Swin-EfficientNet model...")
-        from hybrid2.hybrid_model_transunet import create_hybrid2_transunet
-        model = create_hybrid2_transunet(
+        from hybrid2.model import create_hybrid2_enhanced_full
+        model = create_hybrid2_enhanced_full(
             num_classes=num_classes,
             img_size=img_size
         )

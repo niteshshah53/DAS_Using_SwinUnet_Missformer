@@ -1,7 +1,7 @@
 #!/bin/bash -l
-#SBATCH --job-name=Hybrid1_enhanced_train_test
-#SBATCH --output=./Results_Optimized_Hyperparameters/v3/hybrid13/UDIADS_BIB_MS/train_test_enhanced_%j.out
-#SBATCH --error=./Results_Optimized_Hyperparameters/v3/hybrid13/UDIADS_BIB_MS/train_test_enhanced_%j.out
+#SBATCH --job-name=Syr341FS_baseline_groupnorm
+#SBATCH --output=./Results/UDIADS_BIB_FS/Syr341FS_baseline_groupnorm_%j.out
+#SBATCH --error=./Results/UDIADS_BIB_FS/Syr341FS_baseline_groupnorm_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -12,6 +12,14 @@
 #SBATCH --export=NONE
 unset SLURM_EXPORT_ENV
 
+# ============================================================================
+# HYBRID2 BASELINE TRAINING SCRIPT
+# ============================================================================
+# Model: Hybrid2 Baseline (Swin Transformer Encoder + EfficientNet Decoder)
+# Dataset: U-DIADS-Bib-FS_patched (Full-Size patched dataset)
+# Manuscripts: Latin2FS, Latin14396FS, Latin16746FS, Syr341FS
+# ============================================================================
+
 # Load modules
 module purge
 module load python/pytorch2.6py3.12
@@ -20,7 +28,7 @@ module load cudnn
 
 # Create logs directory 
 mkdir -p ../../logs
-mkdir -p ./Results_Optimized_Hyperparameters/v3/hybrid13/UDIADS_BIB_MS
+mkdir -p ./Results/UDIADS_BIB_FS
 
 conda activate base
 
@@ -28,49 +36,141 @@ conda activate base
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0
 
-# Train all manuscripts one by one (Latin2 Latin14396 Latin16746 Syr341) (CB55, CSG18, CSG863)
-MANUSCRIPTS=(Latin2 Latin14396 Latin16746 Syr341)
+# ============================================================================
+# MODEL ARCHITECTURE COMPONENTS
+# ============================================================================
+# Hybrid2 Baseline consists of:
+#
+# ENCODER:
+#   ✓ Swin Transformer Encoder (4 stages)
+#     - Stage 1: 96 dim, 3 heads, 2 blocks, resolution: H/4 × W/4
+#     - Stage 2: 192 dim, 6 heads, 2 blocks, resolution: H/8 × W/8
+#     - Stage 3: 384 dim, 12 heads, 2 blocks, resolution: H/16 × W/16
+#     - Stage 4: 768 dim, 24 heads, 2 blocks, resolution: H/32 × W/32
+#     - Patch Embedding: 4×4 patches, 3 → 96 channels
+#     - Patch Merging: 2×2 downsampling between stages
+#     - Window Attention: 7×7 windows with relative position bias
+#
+# BOTTLENECK:
+#   ✓ 2 Swin Transformer Blocks (768 dim, 24 heads)
+#     - Resolution: H/32 × W/32
+#     - Window size: 7×7
+#     - Drop path rate: 0.1
+#
+# DECODER:
+#   ✓ EfficientNet-B4 Style CNN Decoder
+#     - Decoder channels: [256, 128, 64, 32]
+#     - Upsampling: Bilinear interpolation + Conv layers
+#     - Normalization: BatchNorm (baseline)
+#     - Activation: ReLU
+#
+# SKIP CONNECTIONS:
+#   ✓ Simple Skip Connections (token → CNN conversion)
+#     - Converts encoder tokens to CNN features via projection
+#     - Concatenates with decoder features
+#     - No attention-based fusion (baseline)
+#
+# POSITIONAL EMBEDDINGS:
+#   ✓ 2D Learnable Positional Embeddings (ENABLED by default)
+#     - Matches SwinUnet pattern (relative position bias in Swin blocks)
+#     - Added to bottleneck features before decoder
+#     - Can be disabled with --no_pos_embed flag
+#
+# OPTIONAL FEATURES (DISABLED in baseline):
+#   ✗ Deep Supervision (--use_deep_supervision)
+#   ✗ CBAM Attention (--use_cbam)
+#   ✗ Smart Skip Connections (--use_smart_skip)
+#   ✗ Cross-Attention Bottleneck (--use_cross_attn)
+#   ✗ Multi-Scale Aggregation (--use_multiscale_agg)
+#   ✓ GroupNorm (--use_groupnorm) - uses BatchNorm instead
+# ============================================================================
+
+# Train all manuscripts one by one (Latin2FS Latin14396FS Latin16746FS Syr341FS)
+MANUSCRIPTS=(Syr341FS)
 
 for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
-    echo "=== Training hybrid1 Model $MANUSCRIPT ==="
+    echo ""
+    echo "========================================================================"
+    echo "Training Hybrid2 Baseline Model: $MANUSCRIPT"
+    echo "========================================================================"
+    echo "Dataset: U-DIADS-Bib-FS_patched"
+    echo "Architecture: Swin Transformer Encoder → 2 Swin Blocks Bottleneck → EfficientNet-B4 Decoder"
+    echo "Components Enabled:"
+    echo "  ✓ Swin Encoder (4 stages)"
+    echo "  ✓ Bottleneck: 2 Swin Transformer blocks"
+    echo "  ✓ EfficientNet-B4 Decoder"
+    echo "  ✓ Simple Skip Connections"
+    echo "  ✓ Positional Embeddings (default: True)"
+    echo "  ✓ GroupNorm (baseline normalization: uses BatchNorm instead)"
+    echo "Components Disabled (baseline):"
+    echo "  ✗ Deep Supervision"
+    echo "  ✗ CBAM Attention"
+    echo "  ✗ Smart Skip Connections"
+    echo "  ✗ Cross-Attention Bottleneck"
+    echo "  ✗ Multi-Scale Aggregation"
+    echo "========================================================================"
+    
     python3 train.py \
-        --model hybrid1 \
-        --use_enhanced \
+        --model hybrid2 \
+        --use_baseline \
+        --efficientnet_variant b4 \
         --dataset UDIADS_BIB \
-        --udiadsbib_root "../../U-DIADS-Bib-MS_patched" \
+        --udiadsbib_root "../../U-DIADS-Bib-FS_patched" \
         --manuscript ${MANUSCRIPT} \
         --use_patched_data \
         --batch_size 4 \
         --max_epochs 300 \
         --base_lr 0.0001 \
-        --patience 50 \
-        --scheduler_type CosineAnnealingWarmRestarts \
-        --output_dir "./Results_Optimized_Hyperparameters/v3/hybrid13/UDIADS_BIB_MS/udiadsbib_Hybrid1_enhanced_${MANUSCRIPT}"
+        --patience 150 \
+        --use_groupnorm \
+        --scheduler_type ReduceLROnPlateau \
+        --output_dir "./Results/UDIADS_BIB_FS/${MANUSCRIPT}"
 
-    echo "=== Testing hybrid1 Model $MANUSCRIPT ==="
+    echo ""
+    echo "========================================================================"
+    echo "Testing Hybrid2 Baseline Model: $MANUSCRIPT"
+    echo "========================================================================"
+    
     python3 test.py \
-        --model hybrid1 \
-        --use_enhanced \
+        --model hybrid2 \
+        --use_baseline \
+        --efficientnet_variant b4 \
         --dataset UDIADS_BIB \
-        --udiadsbib_root "../../U-DIADS-Bib-MS_patched" \
+        --udiadsbib_root "../../U-DIADS-Bib-FS_patched" \
         --manuscript ${MANUSCRIPT} \
         --use_patched_data \
         --is_savenii \
         --use_tta \
-        --output_dir "./Results_Optimized_Hyperparameters/v3/hybrid13/UDIADS_BIB_MS/udiadsbib_Hybrid1_enhanced_${MANUSCRIPT}"
+        --use_crf \
+        --use_groupnorm \
+        --output_dir "./Results/UDIADS_BIB_FS/${MANUSCRIPT}"
 done
 
 echo ""
 echo "========================================================================"
-echo "ALL MANUSCRIPTS COMPLETED - HYBRID1 Model!"
+echo "ALL MANUSCRIPTS COMPLETED - HYBRID2 BASELINE MODEL"
 echo "========================================================================"
-echo "Results saved in: ./Results_Optimized_Hyperparameters/v3/hybrid13/UDIADS_BIB_MS/"
+echo "Results saved in: ./Results/UDIADS_BIB_FS/"
 echo ""
-echo "Model: hybrid1 Model (EfficientNet-B4 + Swin-Unet with TransUNet Best Practices)"
-echo "Architecture: EfficientNet-B4 Encoder → Swin-Unet Decoder"
-echo "Scheduler: OneCycleLR (Peak: 10x LR, 30% warmup, cosine decay)"
-echo "Features:"
-echo "  ✓ Deep Supervision (auxiliary outputs)"
-echo "  ✓ Multi-scale Aggregation (bottleneck)"
-echo "  ✓ OneCycleLR Scheduler (optimal for hybrid CNN-transformer models)"
+echo "Model Configuration:"
+echo "  • Architecture: Hybrid2 Baseline (Swin-Encoder + EfficientNet-Decoder)"
+echo "  • Encoder: Swin Transformer (4 stages, 96→768 dim)"
+echo "  • Bottleneck: 2 Swin Transformer blocks (768 dim, 24 heads)"
+echo "  • Decoder: EfficientNet-B4 style CNN decoder"
+echo "  • Skip Connections: Simple token→CNN conversion"
+echo "  • Positional Embeddings: Enabled (default, matching SwinUnet pattern)"
+echo "  • Normalization: GroupNorm (baseline normalization)"
+echo ""
+echo "Training Configuration:"
+echo "  • Dataset: U-DIADS-Bib-FS_patched"
+echo "  • Manuscripts: Latin2FS, Latin14396FS, Latin16746FS, Syr341FS"
+echo "  • Batch Size: 4"
+echo "  • Max Epochs: 300"
+echo "  • Base Learning Rate: 0.0001"
+echo "  • Scheduler: ReduceLROnPlateau (factor=0.5, patience=15)"
+echo "  • Early Stopping: 150 epochs patience"
+echo ""
+echo "Testing Configuration:"
+echo "  • Test-Time Augmentation: Enabled"
+echo "  • Save Predictions: Enabled (NIfTI format)"
 echo ""

@@ -1,4 +1,21 @@
-# Hybrid2 package: TransUNet-Enhanced Swin Model
-from .hybrid_model_transunet import Hybrid2TransUNet, create_hybrid2_transunet_full
+"""
+Hybrid2 package: Enhanced and Baseline Swin Models
+"""
 
-__all__ = ['Hybrid2TransUNet', 'create_hybrid2_transunet_full']
+from .model import (
+    Hybrid2Enhanced, 
+    Hybrid2EnhancedEfficientNet,
+    Hybrid2Baseline,
+    create_hybrid2_enhanced_full,
+    create_hybrid2_efficientnet,
+    create_hybrid2_baseline
+)
+
+__all__ = [
+    'Hybrid2Enhanced', 
+    'Hybrid2EnhancedEfficientNet',
+    'Hybrid2Baseline',
+    'create_hybrid2_enhanced_full',
+    'create_hybrid2_efficientnet',
+    'create_hybrid2_baseline'
+]

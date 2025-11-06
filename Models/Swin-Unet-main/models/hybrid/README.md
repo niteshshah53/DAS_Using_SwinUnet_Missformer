@@ -259,11 +259,9 @@ hybrid/
 │   ├── efficientnet_encoder.py # EfficientNet-B4 encoder
 │   └── swin_decoder.py         # SwinUnet decoder
 ├── hybrid2/                    # Swin-EfficientNet model
-│   ├── hybrid_model_transunet.py # Main TransUNet model implementation
-│   ├── swin_encoder.py         # SwinUnet encoder
-│   ├── transunet_decoder.py    # TransUNet decoder
-│   ├── transunet_improvements.py # Enhanced EfficientNet decoder
-│   └── __init__.py             # Package initialization
+│   ├── model.py               # Main model classes (Hybrid2Enhanced, Hybrid2Baseline, etc.)
+│   ├── components.py          # All building blocks (SwinEncoder, decoders, CBAM, etc.)
+│   └── __init__.py            # Package initialization
 ├── train.py                    # Training script (supports both models)
 ├── test.py                     # Testing script (supports both models)
 ├── trainer.py                  # Training logic (shared, supports both models)
@@ -388,8 +386,8 @@ python3 test.py \
 
 ### Hybrid2 Specific Arguments
 - `--efficientnet_variant`: EfficientNet variant for decoder (`b0`, `b4`, `b5`)
-- `--use_transunet`: Use TransUNet-enhanced Hybrid2 (all best practices)
-- `--use_efficientnet`: Use Enhanced EfficientNet decoder (Pure CNN + TransUNet improvements)
+- `--use_transunet`: Use Enhanced Hybrid2 decoder (all best practices)
+- `--use_efficientnet`: Use Enhanced EfficientNet decoder (Pure CNN + transformer-CNN hybrid improvements)
 
 ### Testing Arguments
 - `--use_tta`: Enable Test-Time Augmentation for improved accuracy (+2-4% mIoU)

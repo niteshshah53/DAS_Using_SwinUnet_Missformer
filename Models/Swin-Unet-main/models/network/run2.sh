@@ -1,7 +1,7 @@
 #!/bin/bash -l
-#SBATCH --job-name=bl_ash_ds_fff_bo_fl_freeze           
-#SBATCH --output=./a3/bl_ash_ds_fff_bo_fl_freeze_%j.out
-#SBATCH --error=./a3/bl_ash_ds_fff_bo_fl_freeze_%j.out
+#SBATCH --job-name=bl_ash_ds_aff_bo_fl_crf_tta_freeze           
+#SBATCH --output=./a3/bl_ash_ds_aff_bo_fl_crf_tta_freeze_%j.out
+#SBATCH --error=./a3/bl_ash_ds_aff_bo_fl_crf_tta_freeze_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -31,13 +31,15 @@ conda activate pytorch2.6-py3.12
 # Bo  = Bottleneck (2 Swin Transformer blocks)
 # FL  = Focal Loss (in loss combination)
 # freeze = Freeze encoder during training
-# CURRENT CONFIGURATION: BL + ASH + DS + AFF + Bo + FL
+# crf = CRF post-processing
+# tta = Test-Time Augmentation
+# CURRENT CONFIGURATION: BL + ASH + DS + AFF + Bo + FL + crf + tta + freeze 
 # ============================================================================
 
 echo "============================================================================"
 echo "CNN-TRANSFORMER ABLATION STUDY"
 echo "============================================================================"
-echo "Configuration: BL + ASH + DS + AFF + Bo + FL + freeze"
+echo "Configuration: BL + ASH + DS + AFF + Bo + FL + crf + tta + freeze"
 echo ""
 echo "Component Details:"
 echo "  ✓ BL  (Baseline)              : EfficientNet-B4 encoder + Swin-UNet decoder"
@@ -47,13 +49,15 @@ echo "  ✓ AFF (Attention Feature Fusion): Attention-based fusion"
 echo "  ✓ Bo  (Bottleneck)            : 2 Swin blocks at encoder-decoder bridge"
 echo "  ✓ FL  (Focal Loss)            : In combination (0.3*CE + 0.2*FL + 0.5*Dice)"
 echo "  ✓ freeze (Freeze encoder)      : Freeze encoder during training"
+echo "  ✓ crf (CRF post-processing)    : CRF post-processing"
+echo "  ✓ tta (Test-Time Augmentation)  : Test-Time Augmentation"
 echo ""
 echo "Training Parameters:"
 echo "  - Batch Size: 4"
 echo "  - Max Epochs: 300"
 echo "  - Learning Rate: 0.0001"
 echo "  - Scheduler: CosineAnnealingWarmRestarts (better for longer training)"
-echo "  - Early Stopping: 100 epochs patience"
+echo "  - Early Stopping: 50 epochs patience"
 echo "  - Adapter Mode: streaming"
 echo "============================================================================"
 echo ""
@@ -67,7 +71,7 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
     echo "║  TRAINING: $MANUSCRIPT"
     echo "╚════════════════════════════════════════════════════════════════════════╝"
     echo ""
-    echo "Active Components: BL + ASH + DS + AFF + Bo + FL + freeze"
+    echo "Active Components: BL + ASH + DS + AFF + Bo + FL + crf + tta + freeze"
     echo "Output Directory: ./a3/${MANUSCRIPT}"
     echo ""
     
@@ -86,7 +90,7 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --batch_size 4 \
         --max_epochs 300 \
         --base_lr 0.0001 \
-        --patience 100 \
+        --patience 50 \
         --output_dir "./a3/${MANUSCRIPT}"
     
     TRAIN_EXIT_CODE=$?
@@ -116,6 +120,8 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
             --bottleneck \
             --freeze_encoder \
             --is_savenii \
+            --use_tta \
+            --use_crf \
             --output_dir "./a3/${MANUSCRIPT}"
         
         TEST_EXIT_CODE=$?
@@ -148,6 +154,6 @@ echo ""
 echo "============================================================================"
 echo "ALL MANUSCRIPTS PROCESSED"
 echo "============================================================================"
-echo "Configuration Used: BL + ASH + DS + AFF + Bo + FL + freeze"
+echo "Configuration Used: BL + ASH + DS + AFF + Bo + FL + crf + tta + freeze"
 echo "Results Location: ./a3/"
 echo "============================================================================"

@@ -65,14 +65,36 @@ Examples:
     # Model selection
     parser.add_argument('--model', type=str, default='hybrid1', choices=['hybrid1', 'hybrid2'],
                        help='Model architecture to test: hybrid1 (EfficientNet-Swin) or hybrid2 (Swin-EfficientNet)')
-    parser.add_argument('--efficientnet_variant', type=str, default='b4', choices=['b0', 'b4', 'b5'],
-                       help='EfficientNet variant for hybrid2 decoder (b0, b4, b5)')
+    parser.add_argument('--efficientnet_variant', type=str, default='b4', choices=['b0', 'b4'],
+                       help='EfficientNet variant for hybrid2 baseline decoder (b0, b4)')
+    
+    # Hybrid2 model variants
+    parser.add_argument('--use_baseline', action='store_true', default=False,
+                       help='Use baseline Hybrid2 (must match training configuration)')
     parser.add_argument('--use_transunet', action='store_true', default=False,
-                       help='Use TransUNet-enhanced Hybrid2 (must match training configuration)')
+                       help='Use Enhanced Hybrid2 decoder (must match training configuration)')
     parser.add_argument('--use_efficientnet', action='store_true', default=False,
                        help='Use Enhanced EfficientNet decoder (must match training configuration)')
     parser.add_argument('--use_enhanced', action='store_true', default=False,
                        help='Use Enhanced Hybrid1 with CNN re-embedding (must match training configuration)')
+    
+    # Hybrid2 baseline enhancement flags (only used with --use_baseline, must match training)
+    parser.add_argument('--use_deep_supervision', action='store_true', default=False,
+                       help='Enable deep supervision (must match training configuration)')
+    parser.add_argument('--use_cbam', action='store_true', default=False,
+                       help='Enable CBAM attention (must match training configuration)')
+    parser.add_argument('--use_smart_skip', action='store_true', default=False,
+                       help='Use smart skip connections (must match training configuration)')
+    parser.add_argument('--use_cross_attn', action='store_true', default=False,
+                       help='Enable cross-attention (must match training configuration)')
+    parser.add_argument('--use_multiscale_agg', action='store_true', default=False,
+                       help='Enable multi-scale aggregation (must match training configuration)')
+    parser.add_argument('--use_groupnorm', action='store_true', default=False,
+                       help='Use GroupNorm (must match training configuration)')
+    parser.add_argument('--use_pos_embed', action='store_true', default=True,
+                       help='Enable positional embeddings (default: True, must match training configuration)')
+    parser.add_argument('--no_pos_embed', dest='use_pos_embed', action='store_false',
+                       help='Disable positional embeddings')
     
     # Dataset configuration
     parser.add_argument('--dataset', type=str, default='UDIADS_BIB',
@@ -100,6 +122,10 @@ Examples:
                        help='Save prediction results during inference')
     parser.add_argument('--test_save_dir', type=str, default='../predictions',
                        help='Directory to save prediction results')
+    
+    # CRF post-processing
+    parser.add_argument('--use_crf', action='store_true', default=False,
+                       help='Enable CRF post-processing: refine predictions using DenseCRF for spatial coherence')
     
     # System configuration
     parser.add_argument('--deterministic', type=int, default=1,
@@ -203,29 +229,47 @@ def get_model(args, config=None):
             ).cuda()
     elif args.model == 'hybrid2':
         # Check which decoder variant to use
+        use_baseline = getattr(args, 'use_baseline', False)
         use_transunet = getattr(args, 'use_transunet', False)
         use_efficientnet = getattr(args, 'use_efficientnet', False)
         
-        if use_efficientnet:
+        if use_baseline:
+            print("Loading Hybrid2 BASELINE for testing...")
+            from hybrid2.model import create_hybrid2_baseline
+            model = create_hybrid2_baseline(
+                num_classes=args.num_classes,
+                img_size=args.img_size,
+                efficientnet_variant=getattr(args, 'efficientnet_variant', 'b4'),
+                use_deep_supervision=getattr(args, 'use_deep_supervision', False),
+                use_cbam=getattr(args, 'use_cbam', False),
+                use_smart_skip=getattr(args, 'use_smart_skip', False),
+                use_cross_attn=getattr(args, 'use_cross_attn', False),
+                use_multiscale_agg=getattr(args, 'use_multiscale_agg', False),
+                use_groupnorm=getattr(args, 'use_groupnorm', False),
+                use_pos_embed=getattr(args, 'use_pos_embed', True)  # Default True to match SwinUnet
+            ).cuda()
+        elif use_efficientnet:
             print("Loading Hybrid2-Enhanced EfficientNet for testing...")
-            from hybrid2.hybrid_model_transunet import create_hybrid2_efficientnet
+            from hybrid2.model import create_hybrid2_efficientnet
             model = create_hybrid2_efficientnet(
                 num_classes=args.num_classes,
                 img_size=args.img_size
             ).cuda()
         elif use_transunet:
-            print("Loading Hybrid2-TransUNet for testing...")
-            from hybrid2.hybrid_model_transunet import create_hybrid2_transunet_full
-            model = create_hybrid2_transunet_full(
+            print("Loading Hybrid2 Enhanced for testing...")
+            from hybrid2.model import create_hybrid2_enhanced_full
+            model = create_hybrid2_enhanced_full(
                 num_classes=args.num_classes,
                 img_size=args.img_size
             ).cuda()
         else:
-            from hybrid2.hybrid_model import create_hybrid2_model
-            model = create_hybrid2_model(
+            # Fallback to baseline
+            from hybrid2.model import create_hybrid2_baseline
+            model = create_hybrid2_baseline(
                 num_classes=args.num_classes,
                 img_size=args.img_size,
-                efficientnet_variant=getattr(args, 'efficientnet_variant', 'b4')
+                efficientnet_variant=getattr(args, 'efficientnet_variant', 'b4'),
+                use_deep_supervision=True  # Default best practice
             ).cuda()
     else:
         raise ValueError(f"Unknown model: {args.model}. Use 'hybrid1' or 'hybrid2'")
@@ -283,16 +327,47 @@ def load_model_checkpoint(model, args):
         else:
             raise FileNotFoundError(f"No checkpoint found in {args.output_dir}")
     
-    # Load checkpoint with strict=False to handle minor differences like dynamic positional embeddings
-    checkpoint = torch.load(checkpoint_path)
-    msg = model.load_state_dict(checkpoint, strict=False)
-    print(f"Model checkpoint loaded: {msg}")
+    # Load checkpoint with appropriate strictness based on architecture match
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
-    # If there are missing or unexpected keys, print them for debugging
+    # Extract model_state from checkpoint (checkpoint may be a dict with 'model_state' key or direct state_dict)
+    if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
+        model_state_dict = checkpoint['model_state']
+        print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+        if 'best_val_loss' in checkpoint:
+            print(f"Best validation loss: {checkpoint['best_val_loss']:.4f}")
+    else:
+        # If checkpoint is already a state_dict, use it directly (backward compatibility)
+        model_state_dict = checkpoint
+    
+    # Load model state with strict=False to handle minor differences
+    msg = model.load_state_dict(model_state_dict, strict=False)
+    
+    # Print loading results
     if msg.missing_keys:
-        print(f"  Missing keys (will use initialized values): {len(msg.missing_keys)}")
+        print(f"  ⚠️  Missing keys (will use initialized values): {len(msg.missing_keys)}")
+        if len(msg.missing_keys) <= 10:
+            for key in msg.missing_keys:
+                print(f"     - {key}")
+        else:
+            for key in msg.missing_keys[:5]:
+                print(f"     - {key}")
+            print(f"     ... and {len(msg.missing_keys) - 5} more")
+    
     if msg.unexpected_keys:
-        print(f"  Unexpected keys (ignored): {len(msg.unexpected_keys)}")
+        print(f"  ⚠️  Unexpected keys (ignored): {len(msg.unexpected_keys)}")
+        if len(msg.unexpected_keys) <= 10:
+            for key in msg.unexpected_keys:
+                print(f"     - {key}")
+        else:
+            for key in msg.unexpected_keys[:5]:
+                print(f"     - {key}")
+            print(f"     ... and {len(msg.unexpected_keys) - 5} more")
+    
+    if not msg.missing_keys and not msg.unexpected_keys:
+        print(f"  ✅ Model checkpoint loaded successfully (exact match)")
+    else:
+        print(f"  ✅ Model checkpoint loaded successfully (with warnings)")
     
     return os.path.basename(checkpoint_path)
 
@@ -470,7 +545,7 @@ def estimate_image_dimensions(original_name, original_img_dir, patches, patch_po
     return max_x, max_y, patches_per_row
 
 
-def apply_tta_single_patch(model, patch_tensor, num_classes):
+def apply_tta_single_patch(model, patch_tensor, num_classes, return_probs=False):
     """
     Apply test-time augmentation to a single patch for higher accuracy.
     
@@ -484,9 +559,10 @@ def apply_tta_single_patch(model, patch_tensor, num_classes):
         model: Neural network model
         patch_tensor: Input patch tensor
         num_classes: Number of segmentation classes
+        return_probs (bool): If True, return softmax probabilities instead of predictions
         
     Returns:
-        np.ndarray: Augmented prediction
+        np.ndarray: Augmented prediction or probabilities [H, W] or [H, W, C]
     """
     predictions = []
     
@@ -527,10 +603,16 @@ def apply_tta_single_patch(model, patch_tensor, num_classes):
     
     # Average all predictions
     avg_prediction = torch.stack(predictions).mean(dim=0)
-    return torch.argmax(avg_prediction, dim=1).cpu().numpy()[0]
+    
+    if return_probs:
+        # Return probabilities [H, W, C]
+        return avg_prediction.squeeze(0).cpu().numpy().transpose(1, 2, 0)
+    else:
+        # Return class predictions [H, W]
+        return torch.argmax(avg_prediction, dim=1).cpu().numpy()[0]
 
 
-def stitch_patches(patches, patch_positions, max_x, max_y, patches_per_row, patch_size, model, use_tta=False, num_classes=6):
+def stitch_patches(patches, patch_positions, max_x, max_y, patches_per_row, patch_size, model, use_tta=False, num_classes=6, return_probs=False):
     """
     Stitch together patch predictions into full image.
     
@@ -543,14 +625,19 @@ def stitch_patches(patches, patch_positions, max_x, max_y, patches_per_row, patc
         model: Neural network model
         use_tta (bool): Whether to use test-time augmentation
         num_classes (int): Number of segmentation classes
+        return_probs (bool): If True, return softmax probabilities instead of predictions
         
     Returns:
-        numpy.ndarray: Stitched prediction map
+        numpy.ndarray: Stitched prediction map [H, W] or probability map [H, W, C]
     """
     import torchvision.transforms.functional as TF
     
-    pred_full = np.zeros((max_y, max_x), dtype=np.int32)
-    count_map = np.zeros((max_y, max_x), dtype=np.int32)
+    if return_probs:
+        prob_full = np.zeros((max_y, max_x, num_classes), dtype=np.float32)
+        count_map = np.zeros((max_y, max_x), dtype=np.int32)
+    else:
+        pred_full = np.zeros((max_y, max_x), dtype=np.int32)
+        count_map = np.zeros((max_y, max_x), dtype=np.int32)
     
     for i, patch_path in enumerate(patches):
         patch_id = patch_positions[patch_path]
@@ -565,7 +652,10 @@ def stitch_patches(patches, patch_positions, max_x, max_y, patches_per_row, patc
         
         if use_tta:
             # Use TTA for improved accuracy
-            pred_patch = apply_tta_single_patch(model, patch_tensor, num_classes)
+            if return_probs:
+                patch_probs = apply_tta_single_patch(model, patch_tensor, num_classes, return_probs=True)
+            else:
+                pred_patch = apply_tta_single_patch(model, patch_tensor, num_classes, return_probs=False)
         else:
             # Standard inference
             with torch.no_grad():
@@ -573,23 +663,143 @@ def stitch_patches(patches, patch_positions, max_x, max_y, patches_per_row, patc
                 # Handle deep supervision (tuple of main + aux outputs)
                 if isinstance(output, tuple):
                     output = output[0]  # Use only main output for inference
-                pred_patch = torch.argmax(output, dim=1).cpu().numpy()[0]
+                
+                if return_probs:
+                    patch_probs = torch.softmax(output, dim=1).squeeze(0).cpu().numpy().transpose(1, 2, 0)
+                else:
+                    pred_patch = torch.argmax(output, dim=1).cpu().numpy()[0]
         
-        # Add to prediction map with boundary checking
-        if y + patch_size <= pred_full.shape[0] and x + patch_size <= pred_full.shape[1]:
-            pred_full[y:y+patch_size, x:x+patch_size] += pred_patch
-            count_map[y:y+patch_size, x:x+patch_size] += 1
+        # Add to prediction/probability map with boundary checking
+        if return_probs:
+            if y + patch_size <= prob_full.shape[0] and x + patch_size <= prob_full.shape[1]:
+                prob_full[y:y+patch_size, x:x+patch_size] += patch_probs
+                count_map[y:y+patch_size, x:x+patch_size] += 1
+            else:
+                # Handle edge cases
+                valid_h = min(patch_size, prob_full.shape[0] - y)
+                valid_w = min(patch_size, prob_full.shape[1] - x)
+                if valid_h > 0 and valid_w > 0:
+                    prob_full[y:y+valid_h, x:x+valid_w] += patch_probs[:valid_h, :valid_w]
+                    count_map[y:y+valid_h, x:x+valid_w] += 1
         else:
-            # Handle edge cases
-            valid_h = min(patch_size, pred_full.shape[0] - y)
-            valid_w = min(patch_size, pred_full.shape[1] - x)
-            if valid_h > 0 and valid_w > 0:
-                pred_full[y:y+valid_h, x:x+valid_w] += pred_patch[:valid_h, :valid_w]
-                count_map[y:y+valid_h, x:x+valid_w] += 1
+            if y + patch_size <= pred_full.shape[0] and x + patch_size <= pred_full.shape[1]:
+                pred_full[y:y+patch_size, x:x+patch_size] += pred_patch
+                count_map[y:y+patch_size, x:x+patch_size] += 1
+            else:
+                # Handle edge cases
+                valid_h = min(patch_size, pred_full.shape[0] - y)
+                valid_w = min(patch_size, pred_full.shape[1] - x)
+                if valid_h > 0 and valid_w > 0:
+                    pred_full[y:y+valid_h, x:x+valid_w] += pred_patch[:valid_h, :valid_w]
+                    count_map[y:y+valid_h, x:x+valid_w] += 1
     
     # Normalize by count map
-    pred_full = np.round(pred_full / np.maximum(count_map, 1)).astype(np.uint8)
-    return pred_full
+    if return_probs:
+        prob_full = prob_full / np.maximum(count_map[..., np.newaxis], 1)
+        return prob_full
+    else:
+        pred_full = np.round(pred_full / np.maximum(count_map, 1)).astype(np.uint8)
+        return pred_full
+
+
+def apply_crf_postprocessing(prob_map, rgb_image, num_classes=6, 
+                              spatial_weight=3.0, spatial_x_stddev=3.0, spatial_y_stddev=3.0,
+                              color_weight=10.0, color_stddev=50.0,
+                              num_iterations=10):
+    """
+    Apply DenseCRF post-processing to refine segmentation predictions.
+    
+    Args:
+        prob_map: Probability map [H, W, C] with class probabilities
+        rgb_image: Original RGB image [H, W, 3] for pairwise potentials
+        num_classes: Number of segmentation classes
+        spatial_weight: Weight for spatial pairwise potentials
+        spatial_x_stddev: Standard deviation for spatial x dimension
+        spatial_y_stddev: Standard deviation for spatial y dimension
+        color_weight: Weight for color pairwise potentials
+        color_stddev: Standard deviation for color similarity
+        num_iterations: Number of CRF iterations
+        
+    Returns:
+        numpy.ndarray: Refined prediction map [H, W] with class indices
+    """
+    try:
+        # pydensecrf2 package installs as 'pydensecrf' module
+        try:
+            import pydensecrf2.densecrf as dcrf
+            from pydensecrf2.utils import unary_from_softmax, create_pairwise_bilateral, create_pairwise_gaussian
+        except ImportError:
+            # Fallback: try importing as pydensecrf (actual module name)
+            import pydensecrf.densecrf as dcrf
+            from pydensecrf.utils import unary_from_softmax, create_pairwise_bilateral, create_pairwise_gaussian
+    except ImportError:
+        error_msg = (
+            "pydensecrf2 is not installed. CRF post-processing requires this package.\n"
+            "Installation options:\n"
+            "  1. pip install pydensecrf2\n"
+            "  2. conda install -c conda-forge pydensecrf2\n"
+            "  3. python3 -m pip install pydensecrf2\n"
+            "Note: The package installs as 'pydensecrf' module even though pip package is 'pydensecrf2'.\n"
+            "Note: If using conda and encountering symbol errors, try: conda install libgcc"
+        )
+        logging.error(error_msg)
+        raise ImportError("pydensecrf2 is required for CRF post-processing")
+    
+    H, W = prob_map.shape[:2]
+    
+    # Ensure probabilities are in correct format and range
+    if prob_map.shape[2] != num_classes:
+        raise ValueError(f"Probability map has {prob_map.shape[2]} classes but expected {num_classes}")
+    
+    # Ensure prob_map is C-contiguous (required by pydensecrf)
+    prob_map = np.ascontiguousarray(prob_map, dtype=np.float32)
+    
+    # Resize RGB image if dimensions don't match
+    if rgb_image.shape[:2] != (H, W):
+        rgb_image_resized = np.array(Image.fromarray(rgb_image).resize((W, H), Image.BILINEAR))
+    else:
+        rgb_image_resized = rgb_image.copy()
+    
+    # Ensure RGB image is uint8 and C-contiguous (required by pydensecrf)
+    if rgb_image_resized.dtype != np.uint8:
+        rgb_image_resized = np.clip(rgb_image_resized, 0, 255).astype(np.uint8)
+    rgb_image_resized = np.ascontiguousarray(rgb_image_resized, dtype=np.uint8)
+    
+    # Transpose probability map to [C, H, W] format for DenseCRF
+    prob_map_transposed = prob_map.transpose(2, 0, 1)  # [C, H, W]
+    # Ensure transposed array is C-contiguous (required by pydensecrf)
+    prob_map_transposed = np.ascontiguousarray(prob_map_transposed, dtype=np.float32)
+    
+    # Create CRF model
+    crf = dcrf.DenseCRF2D(W, H, num_classes)
+    
+    # Set unary potentials (negative log probabilities)
+    unary = unary_from_softmax(prob_map_transposed)
+    crf.setUnaryEnergy(unary)
+    
+    # Add pairwise potentials
+    
+    # 1. Spatial pairwise potential (encourages nearby pixels to have same label)
+    pairwise_gaussian = create_pairwise_gaussian(sdims=(spatial_y_stddev, spatial_x_stddev), shape=(H, W))
+    crf.addPairwiseEnergy(pairwise_gaussian, compat=spatial_weight)
+    
+    # 2. Bilateral pairwise potential (encourages similar colored pixels to have same label)
+    pairwise_bilateral = create_pairwise_bilateral(
+        sdims=(spatial_y_stddev, spatial_x_stddev),
+        schan=(color_stddev, color_stddev, color_stddev),
+        img=rgb_image_resized,
+        chdim=2
+    )
+    crf.addPairwiseEnergy(pairwise_bilateral, compat=color_weight)
+    
+    # Run inference
+    Q = crf.inference(num_iterations)
+    
+    # Get refined probabilities and convert to prediction
+    refined_probs = np.array(Q).reshape((num_classes, H, W)).transpose(1, 2, 0)
+    refined_pred = np.argmax(refined_probs, axis=2).astype(np.uint8)
+    
+    return refined_pred
 
 
 def save_prediction_results(pred_full, original_name, class_colors, result_dir):
@@ -745,10 +955,18 @@ def inference(args, model, test_save_path=None):
     
     logging.info(f"Found {len(patch_files)} patches for {args.manuscript}")
     
+    use_crf = getattr(args, 'use_crf', False)
+    
     if args.use_tta:
         logging.info("Using Test-Time Augmentation (TTA) for improved accuracy")
     else:
         logging.info("Using standard inference (no TTA)")
+    
+    if use_crf:
+        logging.info("CRF post-processing: Enabled")
+        logging.info("  - DenseCRF with spatial and color pairwise potentials")
+    else:
+        logging.info("CRF post-processing: Disabled")
     
     # Initialize metrics
     TP = np.zeros(n_classes, dtype=np.float64)
@@ -773,11 +991,53 @@ def inference(args, model, test_save_path=None):
         )
         
         # Stitch patches together
-        pred_full = stitch_patches(
-            patches, patch_positions, max_x, max_y, 
-            patches_per_row, patch_size, model,
-            use_tta=args.use_tta, num_classes=n_classes
-        )
+        if use_crf:
+            # Get both predictions and probabilities for CRF
+            prob_full = stitch_patches(
+                patches, patch_positions, max_x, max_y, 
+                patches_per_row, patch_size, model,
+                use_tta=args.use_tta, num_classes=n_classes, return_probs=True
+            )
+            
+            # Load original RGB image for CRF pairwise potentials
+            orig_img_rgb = None
+            for ext in ['.jpg', '.png', '.tif', '.tiff']:
+                orig_img_path = os.path.join(original_img_dir, f"{original_name}{ext}")
+                if os.path.exists(orig_img_path):
+                    orig_img_pil = Image.open(orig_img_path).convert("RGB")
+                    orig_img_rgb = np.array(orig_img_pil)
+                    break
+            
+            if orig_img_rgb is not None:
+                logging.info(f"Applying CRF post-processing to {original_name}")
+                try:
+                    # Apply CRF refinement
+                    pred_full = apply_crf_postprocessing(
+                        prob_full, orig_img_rgb, 
+                        num_classes=n_classes,
+                        spatial_weight=3.0,
+                        spatial_x_stddev=3.0,
+                        spatial_y_stddev=3.0,
+                        color_weight=10.0,
+                        color_stddev=50.0,
+                        num_iterations=10
+                    )
+                    logging.info(f"CRF post-processing completed for {original_name}")
+                except Exception as e:
+                    logging.warning(f"CRF post-processing failed for {original_name}: {e}")
+                    logging.warning("Falling back to non-CRF predictions")
+                    # Fall back to argmax if CRF fails
+                    pred_full = np.argmax(prob_full, axis=2).astype(np.uint8)
+            else:
+                logging.warning(f"Original image not found for CRF: {original_name}, using non-CRF predictions")
+                pred_full = np.argmax(prob_full, axis=2).astype(np.uint8)
+        else:
+            # Standard inference without CRF
+            pred_full = stitch_patches(
+                patches, patch_positions, max_x, max_y, 
+                patches_per_row, patch_size, model,
+                use_tta=args.use_tta, num_classes=n_classes, return_probs=False
+            )
         
         # Save prediction results
         save_prediction_results(pred_full, original_name, class_colors, result_dir)
@@ -845,6 +1105,16 @@ def main():
     
     # Set up reproducible testing
     setup_reproducible_testing(args)
+    
+    # Print configuration
+    print(f"Model: {args.model}")
+    print(f"Dataset: {args.dataset}")
+    print(f"Manuscript: {args.manuscript}")
+    print(f"Test-Time Augmentation: {'Enabled' if args.use_tta else 'Disabled'}")
+    print(f"CRF post-processing: {'Enabled' if args.use_crf else 'Disabled'}")
+    if args.use_crf:
+        print("  - DenseCRF with spatial and color pairwise potentials")
+    print()
     
     # Create model (no config needed for Hybrid)
     model = get_model(args, config=None)
