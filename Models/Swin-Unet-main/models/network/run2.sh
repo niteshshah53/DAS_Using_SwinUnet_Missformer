@@ -1,13 +1,12 @@
 #!/bin/bash -l
-#SBATCH --job-name=h11_baseline2       
-#SBATCH --output=./a1/baseline2_AFF_%j.out
-#SBATCH --error=./a1/baseline2_AFF_%j.out
+#SBATCH --job-name=h1_baseline2_msa_smart
+#SBATCH --output=./a3/baseline2_msa_smart_%j.out
+#SBATCH --error=./a3/baseline2_msa_smart_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --time=22:00:00
-#SBATCH --gres=gpu:rtx3080:1
-#SBATCH --partition=rtx3080
+#SBATCH --gres=gpu:1
 
 #SBATCH --export=NONE
 unset SLURM_EXPORT_ENV
@@ -24,39 +23,37 @@ conda activate pytorch2.6-py3.12
 export PYTHONPATH="${HOME}/.local/lib/python3.12/site-packages:${PYTHONPATH}"
 
 # ============================================================================
-# BASELINE NETWORK MODEL CONFIGURATION + SMART SKIP CONNECTIONS
+# BASELINE NETWORK MODEL CONFIGURATION
 # ============================================================================
-# Configuration: BASELINE + SMART SKIP
+# Baseline Configuration:
 #   ✓ EfficientNet-B4 Encoder
 #   ✓ Bottleneck: 2 Swin Transformer blocks (automatically enabled)
 #   ✓ Swin Transformer Decoder
-#   ✓ Smart skip connections (attention-based fusion)
+#   ✓ Smart Skip Connections
 #   ✓ Adapter mode: streaming (default)
 #   ✓ GroupNorm: enabled (default)
 #   ✓ All three losses: CE + Dice + Focal
 #   ✓ Differential LR: Encoder (0.1x), Bottleneck (0.5x), Decoder (1.0x)
 #
-# Components Enabled:
-#   ✓ Smart Skip Connections (fusion_method='smart')
-#
-# Components Disabled:
+# Components Disabled (baseline):
 #   ✗ Deep Supervision
 #   ✗ Fourier Feature Fusion
-#   ✗ Multi-Scale Aggregation
+#   ✓ Multi-Scale Aggregation
 # ============================================================================
 
 echo "============================================================================"
-echo "CNN-TRANSFORMER BASELINE NETWORK MODEL + SMART SKIP CONNECTIONS"
+echo "CNN-TRANSFORMER BASELINE NETWORK MODEL + MULTI-SCALE AGGREGATION"
 echo "============================================================================"
-echo "Configuration: BASELINE + SMART SKIP"
+echo "Configuration: BASELINE + MULTI-SCALE AGGREGATION"
 echo ""
 echo "Component Details:"
 echo "  ✓ EfficientNet-B4 Encoder"
 echo "  ✓ Bottleneck: 2 Swin Transformer blocks"
 echo "  ✓ Swin Transformer Decoder"
-echo "  ✓ Smart skip connections (attention-based fusion: fusion_method='smart')"
+echo "  ✓ Smart Skip Connections"
 echo "  ✓ Adapter mode: streaming"
 echo "  ✓ GroupNorm: enabled"
+echo "  ✓ Multi-Scale Aggregation: enabled"
 echo "  ✓ Loss: CE + Dice + Focal (0.3*CE + 0.2*Focal + 0.5*Dice)"
 echo "  ✓ Differential LR: Encoder (0.1x), Bottleneck (0.5x), Decoder (1.0x)"
 echo ""
@@ -75,11 +72,11 @@ MANUSCRIPTS=(Latin2 Latin14396 Latin16746 Syr341)
 for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
     echo ""
     echo "╔════════════════════════════════════════════════════════════════════════╗"
-    echo "║  TRAINING BASELINE + SMART SKIP: $MANUSCRIPT"
+    echo "║  TRAINING BASELINE + MULTI-SCALE AGGREGATION: $MANUSCRIPT"
     echo "╚════════════════════════════════════════════════════════════════════════╝"
     echo ""
-    echo "Configuration: BASELINE + SMART SKIP"
-    echo "Output Directory: ./a1/${MANUSCRIPT}"
+    echo "Configuration: BASELINE + MULTI-SCALE AGGREGATION"
+    echo "Output Directory: ./a3/${MANUSCRIPT}"
     echo ""
     
     python3 train.py \
@@ -94,7 +91,8 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --base_lr 0.0001 \
         --patience 100 \
         --fusion_method smart \
-        --output_dir "./a1/${MANUSCRIPT}"
+        --use_multiscale_agg \
+        --output_dir "./a3/${MANUSCRIPT}"
     
     TRAIN_EXIT_CODE=$?
     
@@ -108,13 +106,16 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         echo ""
         
         echo "╔════════════════════════════════════════════════════════════════════════╗"
-        echo "║  TESTING BASELINE + SMART SKIP: $MANUSCRIPT"
+        echo "║  TESTING BASELINE + MULTI-SCALE AGGREGATION: $MANUSCRIPT"
         echo "╚════════════════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "Test Configuration:"
+        echo "  ✓ Test-Time Augmentation (TTA): ENABLED"
+        echo "  ✓ CRF Post-processing: ENABLED"
         echo ""
         
         python3 test.py \
             --use_baseline \
-            --fusion_method smart \
             --dataset UDIADS_BIB \
             --udiadsbib_root "../../U-DIADS-Bib-MS_patched" \
             --manuscript ${MANUSCRIPT} \
@@ -122,7 +123,9 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
             --is_savenii \
             --use_tta \
             --use_crf \
-            --output_dir "./a1/${MANUSCRIPT}"
+            --fusion_method smart \
+            --use_multiscale_agg \
+            --output_dir "./a3/${MANUSCRIPT}"
         
         TEST_EXIT_CODE=$?
         
@@ -154,6 +157,6 @@ echo ""
 echo "============================================================================"
 echo "ALL MANUSCRIPTS PROCESSED"
 echo "============================================================================"
-echo "Configuration Used: BASELINE + SMART SKIP"
-echo "Results Location: ./a1/"
+echo "Configuration Used: BASELINE + MULTI-SCALE AGGREGATION"
+echo "Results Location: ./a3/"
 echo "============================================================================"

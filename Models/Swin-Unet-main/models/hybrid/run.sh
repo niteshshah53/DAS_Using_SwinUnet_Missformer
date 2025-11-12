@@ -1,7 +1,7 @@
 #!/bin/bash -l
-#SBATCH --job-name=baseline_groupnorm
-#SBATCH --output=./Results/UDIADS_BIB_MS/baseline_groupnorm_%j.out
-#SBATCH --error=./Results/UDIADS_BIB_MS/baseline_groupnorm_%j.out
+#SBATCH --job-name=baseline2_ds
+#SBATCH --output=./Results/UDIADS_BIB_MS/baseline2_ds_%j.out
+#SBATCH --error=./Results/UDIADS_BIB_MS/baseline2_ds_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -11,15 +11,24 @@
 #SBATCH --export=NONE
 unset SLURM_EXPORT_ENV
 
+# Load modules
+module purge
+module load python/pytorch2.6py3.12
+module load cuda/11.8
+module load cudnn
+
+conda activate pytorch2.6-py3.12
+
+# Add user site-packages to PYTHONPATH to find user-installed packages like pydensecrf2
+export PYTHONPATH="${HOME}/.local/lib/python3.12/site-packages:${PYTHONPATH}"
+
 # ============================================================================
-# HYBRID2 BASELINE TRAINING SCRIPT
+# HYBRID2 BASELINE TRAINING SCRIPT WITH DEEP SUPERVISION
 # ============================================================================
-# Model: Hybrid2 Baseline (Swin Transformer Encoder + EfficientNet Decoder)
+# Model: Hybrid2 Baseline (Swin Transformer Encoder + Simple CNN Decoder)
 # Dataset: U-DIADS-Bib-MS_patched (Full-Size patched dataset)
 # Manuscripts: Latin2, Latin14396, Latin16746, Syr341
-
-
-
+#   
 # Hybrid2 Baseline consists of:
 #
 # ENCODER:
@@ -34,22 +43,26 @@ unset SLURM_EXPORT_ENV
 #
 # BOTTLENECK:
 #   ✓ 2 Swin Transformer Blocks (768 dim, 24 heads)
-#     - Resolution: H/32 × W/32
+#     - Resolution: H/32 × W/32 (7×7 for 224×224 input)
 #     - Window size: 7×7
 #     - Drop path rate: 0.1
+#     - Processes Stage 4 tokens directly (no dimension reduction)
+#     - Output projected from 768 dim to decoder input dim
 #
 # DECODER:
-#   ✓ EfficientNet-B4 Style CNN Decoder
-#     - Decoder channels: [256, 128, 64, 32]
+#   ✓ Simple CNN Decoder (default when --use_baseline is used)
+#     - EfficientNet-inspired channel configuration (b4 variant by default)
+#     - Decoder channels: [256, 128, 64, 32] (b4 variant)
 #     - Upsampling: Bilinear interpolation + Conv layers
-#     - Normalization: BatchNorm (baseline)
+#     - Normalization: GroupNorm (default, better for small batches)
 #     - Activation: ReLU
+#     - Can be replaced with EfficientNet-B4 or ResNet50 via --decoder flag
 #
 # SKIP CONNECTIONS:
-#   ✓ Simple Skip Connections (token → CNN conversion)
-#     - Converts encoder tokens to CNN features via projection
-#     - Concatenates with decoder features
-#     - No attention-based fusion (baseline)
+#   ✓ Smart Skip Connections (--use_smart_skip)
+#     - Attention-based fusion of encoder and decoder features
+#     - Uses channel attention and spatial attention
+#     - Better feature fusion than simple concatenation
 #
 # POSITIONAL EMBEDDINGS:
 #   ✓ 2D Learnable Positional Embeddings (ENABLED by default)
@@ -58,12 +71,13 @@ unset SLURM_EXPORT_ENV
 #     - Can be disabled with --no_pos_embed flag
 #
 # OPTIONAL FEATURES (DISABLED in baseline):
-#   ✗ Deep Supervision (--use_deep_supervision)
+#   ✓ Deep Supervision (--use_deep_supervision)
 #   ✗ CBAM Attention (--use_cbam)
 #   ✗ Smart Skip Connections (--use_smart_skip)
 #   ✗ Cross-Attention Bottleneck (--use_cross_attn)
 #   ✗ Multi-Scale Aggregation (--use_multiscale_agg)
-#   ✓ GroupNorm (--use_groupnorm) - uses BatchNorm instead
+#   ✗ BatchNorm (--use_batchnorm)
+#   ✓ GroupNorm (default: enabled, uses GroupNorm)
 # ============================================================================
 
 # Train all manuscripts one by one (Latin2 Latin14396 Latin16746 Syr341)
@@ -72,29 +86,30 @@ MANUSCRIPTS=(Latin2 Latin14396 Latin16746 Syr341)
 for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
     echo ""
     echo "========================================================================"
-    echo "Training Hybrid2 Baseline Model: $MANUSCRIPT"
+    echo "Training Hybrid2 Baseline Model with Deep Supervision: $MANUSCRIPT"
     echo "========================================================================"
     echo "Dataset: U-DIADS-Bib-MS_patched"
-    echo "Architecture: Swin Transformer Encoder → 2 Swin Blocks Bottleneck → EfficientNet-B4 Decoder"
+    echo "Architecture: Swin Transformer Encoder → 2 Swin Blocks Bottleneck → Simple CNN Decoder"
+    echo "Decoder: Simple Decoder (EfficientNet-b4 channel configuration)"
+    echo ""
     echo "Components Enabled:"
-    echo "  ✓ Swin Encoder (4 stages)"
-    echo "  ✓ Bottleneck: 2 Swin Transformer blocks"
-    echo "  ✓ EfficientNet-B4 Decoder"
-    echo "  ✓ Simple Skip Connections"
-    echo "  ✓ Positional Embeddings (default: True)"
-    echo "  ✓ GroupNorm (baseline normalization: uses BatchNorm instead)"
+    echo "  ✓ Swin Encoder (4 stages: 96→192→384→768 dim)"
+    echo "  ✓ Bottleneck: 2 Swin Transformer blocks (768 dim, 24 heads)"
+    echo "  ✓ Simple CNN Decoder (channels: [256, 128, 64, 32])"
+    echo "  ✓ Deep Supervision"
+    echo "  ✓ Positional Embeddings (default: enabled)"
+    echo "  ✓ GroupNorm (default normalization)"
+    echo ""
     echo "Components Disabled (baseline):"
-    echo "  ✗ Deep Supervision"
     echo "  ✗ CBAM Attention"
     echo "  ✗ Smart Skip Connections"
     echo "  ✗ Cross-Attention Bottleneck"
     echo "  ✗ Multi-Scale Aggregation"
+    echo "  ✗ BatchNorm"
     echo "========================================================================"
     
     python3 train.py \
-        --model hybrid2 \
         --use_baseline \
-        --efficientnet_variant b4 \
         --dataset UDIADS_BIB \
         --udiadsbib_root "../../U-DIADS-Bib-MS_patched" \
         --manuscript ${MANUSCRIPT} \
@@ -102,20 +117,17 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --batch_size 4 \
         --max_epochs 300 \
         --base_lr 0.0001 \
-        --patience 150 \
-        --use_groupnorm \
-        --scheduler_type ReduceLROnPlateau \
+        --patience 100 \
+        --scheduler_type CosineAnnealingWarmRestarts \
         --output_dir "./Results/UDIADS_BIB_MS/${MANUSCRIPT}"
 
     echo ""
     echo "========================================================================"
-    echo "Testing Hybrid2 Baseline Model: $MANUSCRIPT"
+    echo "Testing Hybrid2 Baseline Model with Deep Supervision: $MANUSCRIPT"
     echo "========================================================================"
     
     python3 test.py \
-        --model hybrid2 \
         --use_baseline \
-        --efficientnet_variant b4 \
         --dataset UDIADS_BIB \
         --udiadsbib_root "../../U-DIADS-Bib-MS_patched" \
         --manuscript ${MANUSCRIPT} \
@@ -123,14 +135,14 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --is_savenii \
         --use_tta \
         --use_crf \
-        --use_groupnorm \
         --output_dir "./Results/UDIADS_BIB_MS/${MANUSCRIPT}"
 done
 
 echo ""
 echo "========================================================================"
-echo "ALL MANUSCRIPTS COMPLETED - HYBRID2 BASELINE MODEL"
+echo "ALL MANUSCRIPTS COMPLETED - HYBRID2 BASELINE MODEL WITH DEEP SUPERVISION"
 echo "========================================================================"
+echo "Model: Hybrid2 Baseline (Swin Encoder + Simple Decoder with Deep Supervision)"
 echo "Results saved in: ./Results/UDIADS_BIB_MS/"
 echo ""
 

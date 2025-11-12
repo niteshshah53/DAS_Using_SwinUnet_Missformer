@@ -11,12 +11,13 @@ Supported datasets: U-DIADS-Bib, DIVAHISDB
 
 Usage:
     # For Hybrid EfficientNet-Swin (no config needed):
-    python test.py --model hybrid --output_dir ./models/ --manuscript Latin2 --is_savenii
+    python test.py --model hybrid2 --output_dir ./models/ --manuscript Latin2 --is_savenii
     
 Author: Clean Code Version
 """
 
 import argparse
+import json
 import logging
 import os
 import random
@@ -47,7 +48,7 @@ def parse_arguments():
         epilog="""
 Examples:
   # Test on U-DIADS-Bib dataset with Hybrid EfficientNet-Swin
-  python test.py --model hybrid1 --output_dir ./models/ \\
+  python test.py --model hybrid2 --output_dir ./models/ \\
                  --dataset UDIADS_BIB --manuscript Latin2 --is_savenii
   
   # Test on DIVAHISDB dataset with Hybrid EfficientNet-Swin
@@ -62,21 +63,14 @@ Examples:
     parser.add_argument('--output_dir', type=str, required=True,
                        help='Directory containing trained model checkpoints')
     
-    # Model selection
-    parser.add_argument('--model', type=str, default='hybrid1', choices=['hybrid1', 'hybrid2'],
-                       help='Model architecture to test: hybrid1 (EfficientNet-Swin) or hybrid2 (Swin-EfficientNet)')
-    parser.add_argument('--efficientnet_variant', type=str, default='b4', choices=['b0', 'b4'],
-                       help='EfficientNet variant for hybrid2 baseline decoder (b0, b4)')
-    
     # Hybrid2 model variants
     parser.add_argument('--use_baseline', action='store_true', default=False,
-                       help='Use baseline Hybrid2 (must match training configuration)')
-    parser.add_argument('--use_transunet', action='store_true', default=False,
-                       help='Use Enhanced Hybrid2 decoder (must match training configuration)')
-    parser.add_argument('--use_efficientnet', action='store_true', default=False,
-                       help='Use Enhanced EfficientNet decoder (must match training configuration)')
-    parser.add_argument('--use_enhanced', action='store_true', default=False,
-                       help='Use Enhanced Hybrid1 with CNN re-embedding (must match training configuration)')
+                       help='Use baseline Hybrid2 (required). If used alone, defaults to simple decoder. Must be used with --decoder for other decoders.')
+    parser.add_argument('--decoder', type=str, default='simple',
+                       choices=['simple', 'EfficientNet-B4', 'ResNet50'],
+                       help='Decoder type: simple (default when --use_baseline is used alone), EfficientNet-B4, or ResNet50 (requires --use_baseline, must match training)')
+    parser.add_argument('--efficientnet_variant', type=str, default='b4', choices=['b0', 'b4'],
+                       help='EfficientNet variant for simple decoder (b0, b4). Only used when --decoder simple, must match training')
     
     # Hybrid2 baseline enhancement flags (only used with --use_baseline, must match training)
     parser.add_argument('--use_deep_supervision', action='store_true', default=False,
@@ -89,8 +83,10 @@ Examples:
                        help='Enable cross-attention (must match training configuration)')
     parser.add_argument('--use_multiscale_agg', action='store_true', default=False,
                        help='Enable multi-scale aggregation (must match training configuration)')
-    parser.add_argument('--use_groupnorm', action='store_true', default=False,
-                       help='Use GroupNorm (must match training configuration)')
+    parser.add_argument('--use_groupnorm', action='store_true', default=True,
+                       help='Use GroupNorm (must match training configuration, default: True)')
+    parser.add_argument('--use_batchnorm', action='store_true', default=False,
+                       help='Use BatchNorm instead of GroupNorm (overrides --use_groupnorm, must match training configuration)')
     parser.add_argument('--use_pos_embed', action='store_true', default=True,
                        help='Enable positional embeddings (default: True, must match training configuration)')
     parser.add_argument('--no_pos_embed', dest='use_pos_embed', action='store_false',
@@ -190,89 +186,75 @@ def validate_arguments(args):
         args.num_classes = 4
         if not os.path.exists(args.divahisdb_root):
             raise ValueError(f"DIVAHISDB dataset path not found: {args.divahisdb_root}")
+    
+    # Validate decoder and use_baseline flag usage (matching train.py)
+    use_baseline = getattr(args, 'use_baseline', False)
+    decoder_type = getattr(args, 'decoder', 'simple')
+    
+    # Rule 1: If decoder is specified (and not 'simple'), must use --use_baseline
+    if decoder_type != 'simple' and not use_baseline:
+        raise ValueError(f"--decoder {decoder_type} requires --use_baseline flag. Usage: --use_baseline --decoder {decoder_type}")
+    
+    # Rule 2: Enhancement flags can only be used with --use_baseline
+    enhancement_flags = [
+        ('use_deep_supervision', getattr(args, 'use_deep_supervision', False)),
+        ('use_cbam', getattr(args, 'use_cbam', False)),
+        ('use_smart_skip', getattr(args, 'use_smart_skip', False)),
+        ('use_cross_attn', getattr(args, 'use_cross_attn', False)),
+        ('use_multiscale_agg', getattr(args, 'use_multiscale_agg', False)),
+    ]
+    
+    used_enhancement_flags = [name for name, used in enhancement_flags if used]
+    if used_enhancement_flags and not use_baseline:
+        raise ValueError(f"Enhancement flags {used_enhancement_flags} require --use_baseline flag. Usage: --use_baseline {' '.join([f'--{flag}' for flag in used_enhancement_flags])}")
 
 
-def get_model(args, config=None):
+def get_model(args):
     """
-    Create and load the Hybrid model (hybrid1 or hybrid2).
+    Create and load the Hybrid2 model.
     
     Args:
-        args: Command line arguments
-        config: Model configuration (not used for Hybrid)
+        args: Command line arguments containing model parameters
         
     Returns:
-        torch.nn.Module: Initialized model
+        torch.nn.Module: Initialized Hybrid2 model ready for testing
     """
-    # Determine which hybrid model to use
-    if args.model == 'hybrid1':
-        # Check if enhanced version is requested
-        use_enhanced = getattr(args, 'use_enhanced', False)
-        
-        if use_enhanced:
-            print("Loading Hybrid1 Best Practices for testing...")
-            from hybrid1.hybrid_model import create_hybrid_model
-            model = create_hybrid_model(
-                num_classes=args.num_classes,
-                img_size=args.img_size,
-                pretrained=False,  # Not needed for testing
-                use_deep_supervision=True,
-                use_multiscale_agg=True,
-                use_smart_skip=True
-            ).cuda()
-        else:
-            print("Loading Hybrid1 Baseline for testing...")
-            from hybrid1.hybrid_model import create_hybrid_model
-            model = create_hybrid_model(
-                num_classes=args.num_classes,
-                img_size=args.img_size,
-                pretrained=False  # Not needed for testing
-            ).cuda()
-    elif args.model == 'hybrid2':
-        # Check which decoder variant to use
-        use_baseline = getattr(args, 'use_baseline', False)
-        use_transunet = getattr(args, 'use_transunet', False)
-        use_efficientnet = getattr(args, 'use_efficientnet', False)
-        
-        if use_baseline:
-            print("Loading Hybrid2 BASELINE for testing...")
-            from hybrid2.model import create_hybrid2_baseline
-            model = create_hybrid2_baseline(
-                num_classes=args.num_classes,
-                img_size=args.img_size,
-                efficientnet_variant=getattr(args, 'efficientnet_variant', 'b4'),
-                use_deep_supervision=getattr(args, 'use_deep_supervision', False),
-                use_cbam=getattr(args, 'use_cbam', False),
-                use_smart_skip=getattr(args, 'use_smart_skip', False),
-                use_cross_attn=getattr(args, 'use_cross_attn', False),
-                use_multiscale_agg=getattr(args, 'use_multiscale_agg', False),
-                use_groupnorm=getattr(args, 'use_groupnorm', False),
-                use_pos_embed=getattr(args, 'use_pos_embed', True)  # Default True to match SwinUnet
-            ).cuda()
-        elif use_efficientnet:
-            print("Loading Hybrid2-Enhanced EfficientNet for testing...")
-            from hybrid2.model import create_hybrid2_efficientnet
-            model = create_hybrid2_efficientnet(
-                num_classes=args.num_classes,
-                img_size=args.img_size
-            ).cuda()
-        elif use_transunet:
-            print("Loading Hybrid2 Enhanced for testing...")
-            from hybrid2.model import create_hybrid2_enhanced_full
-            model = create_hybrid2_enhanced_full(
-                num_classes=args.num_classes,
-                img_size=args.img_size
-            ).cuda()
-        else:
-            # Fallback to baseline
-            from hybrid2.model import create_hybrid2_baseline
-            model = create_hybrid2_baseline(
-                num_classes=args.num_classes,
-                img_size=args.img_size,
-                efficientnet_variant=getattr(args, 'efficientnet_variant', 'b4'),
-                use_deep_supervision=True  # Default best practice
-            ).cuda()
-    else:
-        raise ValueError(f"Unknown model: {args.model}. Use 'hybrid1' or 'hybrid2'")
+    use_baseline = getattr(args, 'use_baseline', False)
+    decoder_type = getattr(args, 'decoder', 'simple')
+    
+    # Simplified logic (matching train.py):
+    # - If --use_baseline is used without --decoder → decoder='simple' (default)
+    # - If --use_baseline is used with --decoder → use specified decoder
+    # - If --decoder is used without --use_baseline → error (caught in validate_arguments)
+    if not use_baseline:
+        # No use_baseline flag → error (should be caught in validate, but handle gracefully)
+        print("ERROR: --use_baseline flag is required")
+        print("Usage: --use_baseline [--decoder simple|EfficientNet-B4|ResNet50]")
+        raise ValueError("--use_baseline flag is required")
+    
+    # Handle batch norm flag (if use_batchnorm is set, disable groupnorm)
+    use_groupnorm_value = getattr(args, 'use_groupnorm', True)
+    if getattr(args, 'use_batchnorm', False):
+        use_groupnorm_value = False
+    
+    print("=" * 80)
+    print(f"🚀 Loading Hybrid2 with {decoder_type} Decoder for Testing")
+    print("=" * 80)
+    
+    from hybrid2.model import create_hybrid2_baseline
+    model = create_hybrid2_baseline(
+        num_classes=args.num_classes,
+        img_size=args.img_size,
+        decoder=decoder_type,
+        efficientnet_variant=getattr(args, 'efficientnet_variant', 'b4'),
+        use_deep_supervision=getattr(args, 'use_deep_supervision', False),
+        use_cbam=getattr(args, 'use_cbam', False),
+        use_smart_skip=getattr(args, 'use_smart_skip', False),
+        use_cross_attn=getattr(args, 'use_cross_attn', False),
+        use_multiscale_agg=getattr(args, 'use_multiscale_agg', False),
+        use_groupnorm=use_groupnorm_value,
+        use_pos_embed=getattr(args, 'use_pos_embed', True)
+    ).cuda()
     
     return model
 
@@ -819,10 +801,10 @@ def save_prediction_results(pred_full, original_name, class_colors, result_dir):
 def save_comparison_visualization(pred_full, gt_class, original_name, original_img_dir, 
                                 test_save_path, class_colors, class_names):
     """Save side-by-side comparison visualization."""
+    
     compare_dir = os.path.join(test_save_path, 'compare')
     os.makedirs(compare_dir, exist_ok=True)
     
-    # Create colormap
     cmap = ListedColormap(class_colors)
     n_classes = len(class_colors)
     
@@ -872,15 +854,7 @@ def save_comparison_visualization(pred_full, gt_class, original_name, original_i
 
 
 def compute_segmentation_metrics(pred_full, gt_class, n_classes, TP, FP, FN):
-    """
-    Compute segmentation metrics for each class.
-    
-    Args:
-        pred_full: Prediction array
-        gt_class: Ground truth array
-        n_classes: Number of classes
-        TP, FP, FN: Arrays to accumulate metrics
-    """
+    """Compute segmentation metrics for each class."""
     for cls in range(n_classes):
         pred_c = (pred_full == cls)
         gt_c = (gt_class == cls)
@@ -904,18 +878,138 @@ def print_final_metrics(TP, FP, FN, class_names, num_processed_images):
         f1 = np.zeros(n_classes)
         iou_per_class = np.zeros(n_classes)
     
+    print("\nPer-class metrics:")
+    print("-" * 80)
+    for cls in range(n_classes):
+        print(f"{class_names[cls]:<15}: Precision={precision[cls]:.4f}, "
+              f"Recall={recall[cls]:.4f}, F1={f1[cls]:.4f}, IoU={iou_per_class[cls]:.4f}")
+    
+    print("\nMean metrics:")
+    print("-" * 40)
+    print(f"Mean Precision: {np.mean(precision):.4f}")
+    print(f"Mean Recall: {np.mean(recall):.4f}")
+    print(f"Mean F1-Score: {np.mean(f1):.4f}")
+    print(f"Mean IoU: {np.mean(iou_per_class):.4f}")
+    
     logging.info("\nPer-class metrics:")
     logging.info("-" * 80)
     for cls in range(n_classes):
         logging.info(f"{class_names[cls]:<15}: Precision={precision[cls]:.4f}, "
-                    f"Recall={recall[cls]:.4f}, F1={f1[cls]:.4f}, IoU={iou_per_class[cls]:.4f}")
+                     f"Recall={recall[cls]:.4f}, F1={f1[cls]:.4f}, IoU={iou_per_class[cls]:.4f}")
     
     logging.info("\nMean metrics:")
     logging.info("-" * 40)
     logging.info(f"Mean Precision: {np.mean(precision):.4f}")
     logging.info(f"Mean Recall: {np.mean(recall):.4f}")
-    logging.info(f"Mean F1: {np.mean(f1):.4f}")
+    logging.info(f"Mean F1-Score: {np.mean(f1):.4f}")
     logging.info(f"Mean IoU: {np.mean(iou_per_class):.4f}")
+
+
+def save_metrics_to_file(args, TP, FP, FN, class_names, num_processed_images):
+    """Save metrics to a JSON file for later aggregation."""
+    n_classes = len(class_names)
+    
+    if num_processed_images > 0:
+        precision = TP / (TP + FP + 1e-8)
+        recall = TP / (TP + FN + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+        iou_per_class = TP / (TP + FP + FN + 1e-8)
+        
+        mean_precision = float(np.mean(precision))
+        mean_recall = float(np.mean(recall))
+        mean_f1 = float(np.mean(f1))
+        mean_iou = float(np.mean(iou_per_class))
+    else:
+        mean_precision = mean_recall = mean_f1 = mean_iou = 0.0
+    
+    parent_dir = os.path.dirname(args.output_dir) if os.path.basename(args.output_dir) == args.manuscript else args.output_dir
+    os.makedirs(parent_dir, exist_ok=True)
+    
+    metrics_file = os.path.join(parent_dir, f"metrics_{args.manuscript}.json")
+    
+    metrics_data = {
+        "manuscript": args.manuscript,
+        "mean_precision": mean_precision,
+        "mean_recall": mean_recall,
+        "mean_f1": mean_f1,
+        "mean_iou": mean_iou,
+        "num_images": num_processed_images
+    }
+    
+    with open(metrics_file, 'w') as f:
+        json.dump(metrics_data, f, indent=2)
+    
+    return parent_dir
+
+
+def calculate_and_display_average_metrics(args):
+    """Calculate and display average metrics across all manuscripts."""
+    if 'FS' in args.manuscript or args.manuscript.endswith('FS'):
+        expected_manuscripts = ['Latin2FS', 'Latin14396FS', 'Latin16746FS', 'Syr341FS']
+    else:
+        expected_manuscripts = ['Latin2', 'Latin14396', 'Latin16746', 'Syr341']
+    
+    parent_dir = os.path.dirname(args.output_dir) if os.path.basename(args.output_dir) == args.manuscript else args.output_dir
+    
+    all_metrics = []
+    found_manuscripts = []
+    metrics_files = []
+    
+    print("\nCalculating average metrics...")
+    print(f"Looking for metrics files in: {parent_dir}")
+    
+    for manuscript in expected_manuscripts:
+        metrics_file = os.path.join(parent_dir, f"metrics_{manuscript}.json")
+        if os.path.exists(metrics_file):
+            try:
+                with open(metrics_file, 'r') as f:
+                    data = json.load(f)
+                    all_metrics.append(data)
+                    found_manuscripts.append(manuscript)
+                    metrics_files.append(metrics_file)
+                    print(f"  ✓ Found metrics for {manuscript}")
+            except Exception as e:
+                logging.warning(f"Failed to load metrics for {manuscript}: {e}")
+                print(f"  ✗ Metrics file not found: {metrics_file}")
+        else:
+            print(f"  ✗ Metrics file not found: {metrics_file}")
+    
+    if len(found_manuscripts) > 0:
+        avg_precision = sum(m['mean_precision'] for m in all_metrics) / len(all_metrics)
+        avg_recall = sum(m['mean_recall'] for m in all_metrics) / len(all_metrics)
+        avg_f1 = sum(m['mean_f1'] for m in all_metrics) / len(all_metrics)
+        avg_iou = sum(m['mean_iou'] for m in all_metrics) / len(all_metrics)
+        
+        print("\n" + "="*80)
+        if len(found_manuscripts) == len(expected_manuscripts):
+            print("AVERAGE METRICS ACROSS ALL MANUSCRIPTS")
+        else:
+            print(f"AVERAGE METRICS ACROSS {len(found_manuscripts)} MANUSCRIPT(S)")
+        print("="*80)
+        print(f"Manuscripts: {', '.join(found_manuscripts)}")
+        if len(found_manuscripts) < len(expected_manuscripts):
+            missing = [m for m in expected_manuscripts if m not in found_manuscripts]
+            print(f"Missing: {', '.join(missing)}")
+        print("-"*80)
+        print(f"Mean Precision: {avg_precision:.4f}")
+        print(f"Mean Recall:    {avg_recall:.4f}")
+        print(f"Mean F1-Score:  {avg_f1:.4f}")
+        print(f"Mean IoU:       {avg_iou:.4f}")
+        print("="*80)
+        sys.stdout.flush()
+        
+        # Clean up temporary metrics files
+        for metrics_file in metrics_files:
+            try:
+                os.remove(metrics_file)
+            except Exception as e:
+                logging.warning(f"Failed to delete temporary metrics file {metrics_file}: {e}")
+        
+        return True
+    else:
+        print("No metrics files found for aggregation.")
+        return False
+    
 
 
 def inference(args, model, test_save_path=None):
@@ -1059,7 +1153,7 @@ def inference(args, model, test_save_path=None):
             logging.warning(f"No ground truth found for {original_name}")
             gt_class = np.zeros_like(pred_full)
         
-        # Save comparison visualization
+        # Save comparison visualization (matching Network model)
         if test_save_path and gt_found:
             save_comparison_visualization(
                 pred_full, gt_class, original_name, original_img_dir,
@@ -1086,6 +1180,9 @@ def inference(args, model, test_save_path=None):
     print_final_metrics(TP, FP, FN, class_names, num_processed_images)
     logging.info(f"Inference completed on {num_processed_images} images")
     
+    # Save metrics to JSON file for aggregation
+    save_metrics_to_file(args, TP, FP, FN, class_names, num_processed_images)
+    
     return "Testing Finished!"
 
 
@@ -1107,7 +1204,7 @@ def main():
     setup_reproducible_testing(args)
     
     # Print configuration
-    print(f"Model: {args.model}")
+    print(f"Model: Hybrid2")  # Hardcoded instead of args.model
     print(f"Dataset: {args.dataset}")
     print(f"Manuscript: {args.manuscript}")
     print(f"Test-Time Augmentation: {'Enabled' if args.use_tta else 'Disabled'}")
@@ -1117,7 +1214,7 @@ def main():
     print()
     
     # Create model (no config needed for Hybrid)
-    model = get_model(args, config=None)
+    model = get_model(args)
     
     # Load trained model checkpoint
     try:
@@ -1147,7 +1244,7 @@ def main():
     print()
     print("=== Starting Testing ===")
     print(f"Dataset: {args.dataset}")
-    print(f"Model: {args.model}")
+    print(f"Model: Hybrid2")  # Hardcoded instead of args.model
     print(f"Manuscript: {args.manuscript}")
     print(f"Save predictions: {args.is_savenii}")
     print()
@@ -1158,6 +1255,10 @@ def main():
         print("=== TESTING COMPLETED SUCCESSFULLY ===")
         print(f"Results saved to: {test_save_path if test_save_path else 'No files saved'}")
         print("="*50)
+        
+        # Calculate and display average metrics across all manuscripts
+        calculate_and_display_average_metrics(args)
+        
         return result
         
     except Exception as e:

@@ -1,11 +1,10 @@
 """
-Hybrid Model Training Module
-Training approach for Hybrid models (hybrid1 and hybrid2) with early stopping and class weights.
+Hybrid2 Model Training Module
+Training approach for Hybrid2 model with early stopping and class weights.
 
-Hybrid1: EfficientNetB4 encoder + SwinUnet decoder
-Hybrid2: SwinUnet encoder + EfficientNet decoder
+Hybrid2: SwinUnet encoder + EfficientNet/ResNet50 decoder
 
-Both models use the same training approach with all three losses (CE + Focal + Dice).
+Uses training approach with all three losses (CE + Focal + Dice).
 """
 
 import os
@@ -19,6 +18,8 @@ from torch.utils.data import DataLoader
 from torch.nn import CrossEntropyLoss
 from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
+import warnings
+from collections import defaultdict
 
 # Add common directory to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../common'))
@@ -71,128 +72,147 @@ def setup_logging(output_path):
     return logger
 
 
-def compute_class_weights(train_dataset, num_classes):
+def compute_class_weights(train_dataset, num_classes, smoothing=0.05):
     """
-    Compute class weights for balanced training based on pixel frequency.
-    Uses square root of inverse frequency for extreme imbalances (better than linear).
+    Compute balanced class weights using effective number of samples.
+    
+    Uses the formula from "Class-Balanced Loss Based on Effective Number of Samples"
+    (Cui et al., 2019): weight = (1 - beta) / (1 - beta^n)
+    
     Args:
-        train_dataset: Training dataset object with .mask_paths
+        train_dataset: Training dataset with .mask_paths attribute
         num_classes (int): Number of segmentation classes
+        smoothing (float): Smoothing factor to prevent extreme weights (default: 0.1)
+        
     Returns:
-        torch.Tensor: Class weights (on CUDA if available)
+        torch.Tensor: Normalized class weights on GPU if available
     """
-    print("\nComputing class weights...")
+    print("\n" + "="*80)
+    print("COMPUTING CLASS WEIGHTS")
+    print("="*80)
 
-    # Define color maps for different datasets
-    if num_classes == 6:
-        # UDIADS-BIB color map (standard manuscripts)
-        COLOR_MAP = {
+    # Define color maps
+    COLOR_MAPS = {
+        6: {  # UDIADS-BIB (standard manuscripts)
             (0, 0, 0): 0,        # Background
             (255, 255, 0): 1,    # Paratext
             (0, 255, 255): 2,    # Decoration
             (255, 0, 255): 3,    # Main text
             (255, 0, 0): 4,      # Title
             (0, 255, 0): 5,      # Chapter Heading
-        }
-    elif num_classes == 5:
-        # UDIADS-BIB color map for Syriaque341 (no Chapter Headings)
-        COLOR_MAP = {
+        },
+        5: {  # UDIADS-BIB Syriaque341 (no Chapter Headings)
             (0, 0, 0): 0,        # Background
             (255, 255, 0): 1,    # Paratext
             (0, 255, 255): 2,    # Decoration
             (255, 0, 255): 3,    # Main text
             (255, 0, 0): 4,      # Title
-            # Note: Chapter Heading (0, 255, 0) is not present in Syriaque341
-        }
-        # Also count Chapter Headings pixels but don't include in class map
-        chapter_headings_color = (0, 255, 0)
-    elif num_classes == 4:
-        # DivaHisDB color map
-        COLOR_MAP = {
+        },
+        4: {  # DivaHisDB
             (0, 0, 0): 0,        # Background
             (0, 255, 0): 1,      # Comment
             (255, 0, 0): 2,      # Decoration
             (0, 0, 255): 3,      # Main Text
         }
-        chapter_headings_color = None
-    else:
+    }
+    
+    if num_classes not in COLOR_MAPS:
         raise ValueError(f"Unsupported number of classes: {num_classes}")
-
+    
+    COLOR_MAP = COLOR_MAPS[num_classes]
+    
+    # Count pixels per class
     class_counts = np.zeros(num_classes, dtype=np.float64)
-    unmapped_pixel_count = 0
-    chapter_headings_count = 0
-
+    unmapped_count = 0
+    chapter_heading_count = 0
+    
+    # Count pixels silently (no progress messages)
     for mask_path in train_dataset.mask_paths:
-        mask = np.array(Image.open(mask_path).convert("RGB"))
+        try:
+            mask = np.array(Image.open(mask_path).convert("RGB"))
+        except Exception as e:
+            warnings.warn(f"Failed to load mask {mask_path}: {e}")
+            continue
         
-        # Track mapped pixels
         mapped_mask = np.zeros(mask.shape[:2], dtype=bool)
         
+        # Count pixels for each class
         for rgb, cls in COLOR_MAP.items():
             matches = np.all(mask == rgb, axis=-1)
             class_counts[cls] += np.sum(matches)
             mapped_mask[matches] = True
         
-        # For 5-class mode: count Chapter Headings pixels separately
-        if num_classes == 5 and chapter_headings_color is not None:
-            chapter_matches = np.all(mask == chapter_headings_color, axis=-1)
-            chapter_headings_count += np.sum(chapter_matches)
-            mapped_mask[chapter_matches] = True
+        # Track unmapped pixels (including Chapter Headings in 5-class mode)
+        if num_classes == 5:
+            chapter_matches = np.all(mask == (0, 255, 0), axis=-1)
+            if np.any(chapter_matches):
+                chapter_heading_count += np.sum(chapter_matches)
+                mapped_mask[chapter_matches] = True
         
-        # Count unmapped pixels
         unmapped_pixels = ~mapped_mask
         if np.any(unmapped_pixels):
-            unmapped_pixel_count += np.sum(unmapped_pixels)
+            unmapped_count += np.sum(unmapped_pixels)
 
-    # Report Chapter Headings pixels if found in 5-class mode
-    if num_classes == 5 and chapter_headings_count > 0:
-        print(f"\n⚠️  WARNING: Found {chapter_headings_count:,} Chapter Headings pixels in Syr341FS!")
-        print(f"   These will be mapped to Background (class 0)")
-        print(f"   This may contribute to class imbalance.")
-
-    # Compute frequencies
+    # Report findings
     total_pixels = class_counts.sum()
     if total_pixels == 0:
-        raise ValueError("No pixels found in masks!")
+        raise ValueError("No valid pixels found in training masks!")
     
+    if num_classes == 5 and chapter_heading_count > 0:
+        print(f"\n⚠️  WARNING: Found {chapter_heading_count:,} Chapter Heading pixels")
+        print(f"   These will be mapped to Background (class 0)")
+    
+    if unmapped_count > 0:
+        print(f"⚠️  WARNING: {unmapped_count:,} unmapped pixels (mapped to Background)")
+    
+    # Compute class frequencies
     class_freq = class_counts / total_pixels
-
-    # Use square root of inverse frequency for extreme imbalances
-    # This is less aggressive than linear inverse frequency but still helps rare classes
-    # Formula: sqrt(1 / (freq + epsilon)) then normalize
-    epsilon = 1e-6
-    weights = np.sqrt(1.0 / (class_freq + epsilon))
     
-    # Normalize weights to sum to num_classes (balanced baseline)
+    # Effective Number of Samples (ENS) weighting
+    # beta = 0.9999 for highly imbalanced datasets, 0.99 for moderate imbalance
+    beta = 0.9999 if np.min(class_freq[class_freq > 0]) < 0.001 else 0.99
+    
+    effective_num = 1.0 - np.power(beta, class_counts)
+    weights = (1.0 - beta) / (effective_num + 1e-8)
+    
+    # Apply smoothing to prevent extreme weights
+    if smoothing > 0:
+        # Linear interpolation between computed weights and uniform weights
+        uniform_weights = np.ones(num_classes)
+        weights = (1 - smoothing) * weights + smoothing * uniform_weights
+    
+    # Normalize to sum to num_classes (maintains balanced loss scale)
     weights = weights / weights.sum() * num_classes
     
-    # For extremely rare classes (< 0.5%), apply additional boost
-    rare_threshold = 0.005  # 0.5%
-    for cls in range(num_classes):
-        if class_freq[cls] < rare_threshold and class_freq[cls] > 0:
-            boost_factor = 1.5  # 50% boost for rare classes
-            weights[cls] *= boost_factor
+    # Cap maximum weight to prevent dominance (max 10x the minimum)
+    max_weight_ratio = 10.0
+    min_weight = weights.min()
+    weights = np.minimum(weights, min_weight * max_weight_ratio)
     
-    # Renormalize after boosting
+    # Re-normalize after capping
     weights = weights / weights.sum() * num_classes
-
-    # Print detailed analysis
-    print("\n" + "-"*80)
-    print("CLASS DISTRIBUTION ANALYSIS")
-    print("-"*80)
-    print(f"{'Class':<6} {'Frequency':<15} {'Weight':<15} {'Pixels':<15}")
-    print("-"*80)
+    
+    # Print class statistics
+    print(f"\nClass Distribution:")
+    print(f"{'Class':<20} {'Pixels':<15} {'Frequency':<15} {'Weight':<15}")
+    print("-" * 65)
     for cls in range(num_classes):
-        pixel_count = int(class_counts[cls])
-        print(f"{cls:<6} {class_freq[cls]:<15.6f} {weights[cls]:<15.6f} {pixel_count:<15,}")
-    print("-"*80)
-    if unmapped_pixel_count > 0:
-        print(f"\n⚠️  Unmapped pixels: {unmapped_pixel_count:,} (mapped to Background)")
-    print()
-
-    # Return as tensor
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.tensor(weights, dtype=torch.float32, device=device)
+        freq_pct = class_freq[cls] * 100
+        weight_val = weights[cls]
+        print(f"{cls:<20} {class_counts[cls]:>14,.0f} {freq_pct:>14.4f}% {weight_val:>14.4f}")
+    
+    print(f"\nTotal pixels: {total_pixels:,}")
+    print(f"Beta: {beta}")
+    print(f"Smoothing: {smoothing}")
+    print(f"Weight range: [{weights.min():.4f}, {weights.max():.4f}]")
+    print("="*80)
+    
+    # Convert to torch tensor and move to GPU if available
+    weights_tensor = torch.from_numpy(weights).float()
+    if torch.cuda.is_available():
+        weights_tensor = weights_tensor.cuda()
+    
+    return weights_tensor
 
 
 def create_data_loaders(train_dataset, val_dataset, batch_size, num_workers, seed):
@@ -255,75 +275,96 @@ def create_data_loaders(train_dataset, val_dataset, batch_size, num_workers, see
     return train_loader, val_loader
 
 
-def create_loss_functions(class_weights, num_classes):
+def create_loss_functions(class_weights, num_classes, focal_gamma=2.0):
     """
-    Create loss functions WITH class weights properly applied.
+    Create properly weighted loss functions.
+    Matches Network model's pattern.
     
     Args:
-        class_weights (torch.Tensor): Weights for each class
-        num_classes (int): Number of segmentation classes
+        class_weights (torch.Tensor): Per-class weights
+        num_classes (int): Number of classes
+        focal_gamma (float): Focal loss focusing parameter (default: 2.0)
         
     Returns:
-        tuple: (cross_entropy_loss, focal_loss, dice_loss)
+        tuple: (ce_loss, focal_loss, dice_loss)
     """
+    # CrossEntropyLoss with class weights and label smoothing (matching Network model)
+    ce_loss = CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     
-    # Apply weights to CrossEntropyLoss (this was missing!)
-    ce_loss = CrossEntropyLoss(weight=class_weights)
+    # Focal loss with gamma=2.0 (matching Network model)
+    focal_loss = FocalLoss(gamma=focal_gamma, weight=class_weights)
     
-    # Reduce focal loss gamma (5 is too aggressive, causes instability)
-    focal_loss = FocalLoss(gamma=3)  # Changed from 5 to 2
-    
-    # Dice loss doesn't use class weights directly
+    # Dice loss (handles class imbalance internally, matching Network model)
     dice_loss = DiceLoss(num_classes)
+    
+    print(f"✓ Loss functions created: CE (weighted, label_smoothing=0.1), Focal (γ={focal_gamma}), Dice")
     
     return ce_loss, focal_loss, dice_loss
 
 
-def compute_combined_loss(predictions, labels, ce_loss, focal_loss, dice_loss):
+def compute_combined_loss(predictions, labels, ce_loss, focal_loss, dice_loss, 
+                          ce_weight=0.25, focal_weight=0.35, dice_weight=0.4):
     """
-    Unified loss computation for both training and validation.
-    Supports deep supervision with auxiliary outputs.
+    Compute combined loss with support for deep supervision.
+    Matches Network model's pattern.
     
     Args:
-        predictions: Model predictions (logits or tuple of (logits, aux_outputs))
+        predictions: Model output (logits or tuple with auxiliary outputs)
         labels: Ground truth labels
         ce_loss, focal_loss, dice_loss: Loss functions
+        ce_weight, focal_weight, dice_weight: Loss combination weights (default: 0.3, 0.2, 0.5)
         
     Returns:
-        torch.Tensor: Combined loss value
+        tuple: (total_loss, loss_dict) where loss_dict contains individual losses
     """
-    # Handle deep supervision (tuple of main + auxiliary outputs)
+    loss_dict = {}
+    
+    # Handle deep supervision
     if isinstance(predictions, tuple):
         logits, aux_outputs = predictions
         
-        # Main loss (full weight)
+        # Main branch losses
         loss_ce = ce_loss(logits, labels)
         loss_focal = focal_loss(logits, labels)
         loss_dice = dice_loss(logits, labels, softmax=True)
-        main_loss = 0.4 * loss_ce + 0.1 * loss_focal + 0.5 * loss_dice
         
-        # Auxiliary losses (decreasing weights for deeper layers)
-        # TransUNet practice: [0.4, 0.3, 0.2] for 3 aux outputs
-        aux_weights = [0.4, 0.3, 0.2][:len(aux_outputs)]
+        main_loss = ce_weight * loss_ce + focal_weight * loss_focal + dice_weight * loss_dice
+        loss_dict['main'] = main_loss.item()
+        loss_dict['ce'] = loss_ce.item()
+        loss_dict['focal'] = loss_focal.item()
+        loss_dict['dice'] = loss_dice.item()
+        
+        # Auxiliary losses with exponentially decaying weights (matching Network model pattern)
+        aux_weights = [0.4 * (0.8 ** i) for i in range(len(aux_outputs))]
         aux_loss = 0.0
         
-        for weight, aux_output in zip(aux_weights, aux_outputs):
+        for i, (weight, aux_output) in enumerate(zip(aux_weights, aux_outputs)):
             aux_ce = ce_loss(aux_output, labels)
             aux_focal = focal_loss(aux_output, labels)
             aux_dice = dice_loss(aux_output, labels, softmax=True)
-            aux_combined = 0.4 * aux_ce + 0.1 * aux_focal + 0.5 * aux_dice
+            aux_combined = ce_weight * aux_ce + focal_weight * aux_focal + dice_weight * aux_dice
             aux_loss += weight * aux_combined
+            loss_dict[f'aux_{i}_ce'] = aux_ce.item()
+            loss_dict[f'aux_{i}_focal'] = aux_focal.item()
+            loss_dict[f'aux_{i}_dice'] = aux_dice.item()
         
         # Total loss: main + weighted auxiliary
-        return main_loss + aux_loss
+        total_loss = main_loss + aux_loss
+        loss_dict['total'] = total_loss.item()
+        return total_loss, loss_dict
     else:
         # Standard single output
         loss_ce = ce_loss(predictions, labels)
         loss_focal = focal_loss(predictions, labels)
         loss_dice = dice_loss(predictions, labels, softmax=True)
         
-        # Balanced combination - same for train and val
-        return 0.4 * loss_ce + 0.1 * loss_focal + 0.5 * loss_dice       
+        # Balanced combination - matching Network model weights
+        total_loss = ce_weight * loss_ce + focal_weight * loss_focal + dice_weight * loss_dice
+        loss_dict['ce'] = loss_ce.item()
+        loss_dict['focal'] = loss_focal.item()
+        loss_dict['dice'] = loss_dice.item()
+        loss_dict['total'] = total_loss.item()
+        return total_loss, loss_dict
 
 
 def create_optimizer_and_scheduler(model, learning_rate, args=None, train_loader=None):
@@ -339,21 +380,25 @@ def create_optimizer_and_scheduler(model, learning_rate, args=None, train_loader
     Returns:
         tuple: (optimizer, scheduler)
     """
-    # TransUNet Best Practice: Differential Learning Rates
+    # Hybrid2 Best Practice: Differential Learning Rates
     # Pretrained encoder gets 10x smaller LR to preserve learned features
+    # Bottleneck (2 Swin blocks) gets 5x smaller LR for gradual adaptation
     # Decoder gets base LR for faster convergence
     
     encoder_params = []
+    bottleneck_params = []
     decoder_params = []
-    adapter_params = []
     
     # Separate parameters by module
     for name, param in model.named_parameters():
-        if 'encoder' in name.lower():
+        if 'encoder' in name.lower() and 'decoder' not in name.lower():
+            # Encoder parameters (not decoder.encoder_projections)
             encoder_params.append(param)
-        elif 'adapter' in name.lower() or 'align' in name.lower() or 'attention' in name.lower():
-            adapter_params.append(param)
+        elif 'bottleneck' in name.lower():
+            # Bottleneck: 2 Swin Transformer blocks
+            bottleneck_params.append(param)
         else:
+            # Decoder parameters (including encoder_projections, decoder blocks, etc.)
             decoder_params.append(param)
     
     # Parameter groups with differential LR and weight decay
@@ -365,10 +410,10 @@ def create_optimizer_and_scheduler(model, learning_rate, args=None, train_loader
             'name': 'encoder'
         },
         {
-            'params': adapter_params,
-            'lr': learning_rate * 0.5,  # Medium LR for adapters
+            'params': bottleneck_params,
+            'lr': learning_rate * 0.5,  # 5x smaller for bottleneck (2 Swin blocks)
             'weight_decay': 5e-3,  # Medium regularization
-            'name': 'adapters'
+            'name': 'bottleneck'
         },
         {
             'params': decoder_params,
@@ -377,6 +422,9 @@ def create_optimizer_and_scheduler(model, learning_rate, args=None, train_loader
             'name': 'decoder'
         }
     ]
+    
+    # Filter out empty groups
+    param_groups = [g for g in param_groups if len(g['params']) > 0]
     
     # Use AdamW optimizer with differential LR
     optimizer = optim.AdamW(
@@ -414,14 +462,16 @@ def create_optimizer_and_scheduler(model, learning_rate, args=None, train_loader
         
     elif scheduler_type == 'ReduceLROnPlateau':
         # ReduceLROnPlateau scheduler - adaptive based on validation loss
+        # Improved: Less aggressive reduction (factor=0.7) and more patience (20 epochs)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
-            factor=0.5,
-            patience=15,  # Wait 15 epochs before reducing
-            min_lr=1e-6
+            factor=0.7,  # Less aggressive reduction (was 0.5)
+            patience=20,  # More patience before reducing (was 15)
+            min_lr=1e-6,  # Minimum learning rate
+            verbose=True  # Print LR reduction messages
         )
-        scheduler_name = "ReduceLROnPlateau (factor=0.5, patience=15)"
+        scheduler_name = "ReduceLROnPlateau (factor=0.7, patience=20)"
         
     elif scheduler_type == 'CosineAnnealingLR':
         # CosineAnnealingLR scheduler - smooth decay without restarts
@@ -442,12 +492,12 @@ def create_optimizer_and_scheduler(model, learning_rate, args=None, train_loader
         )
         scheduler_name = "CosineAnnealingWarmRestarts (T_0=50, T_mult=2)"
     
-    print("🚀 TransUNet Best Practice: Differential Learning Rates")
-    print(f"  📊 Encoder LR:  {learning_rate * 0.1:.6f} (10x smaller, {len(encoder_params)} params)")
-    print(f"  📊 Adapter LR:  {learning_rate * 0.5:.6f} (5x smaller, {len(adapter_params)} params)")
-    print(f"  📊 Decoder LR:  {learning_rate:.6f} (base LR, {len(decoder_params)} params)")
+    print("🚀 Hybrid2 Best Practice: Differential Learning Rates")
+    print(f"  📊 Encoder LR:     {learning_rate * 0.1:.6f} (10x smaller, {len(encoder_params)} params)")
+    print(f"  📊 Bottleneck LR:  {learning_rate * 0.5:.6f} (5x smaller, {len(bottleneck_params)} params)")
+    print(f"  📊 Decoder LR:     {learning_rate:.6f} (base LR, {len(decoder_params)} params)")
     print(f"  ⚙️  Scheduler: {scheduler_name}")
-    print(f"  ⚙️  Weight decay: Encoder=1e-3, Adapters=5e-3, Decoder=1e-2")
+    print(f"  ⚙️  Weight decay: Encoder=1e-3, Bottleneck=5e-3, Decoder=1e-2")
     
     return optimizer, scheduler
 
@@ -455,99 +505,190 @@ def create_optimizer_and_scheduler(model, learning_rate, args=None, train_loader
 def run_training_epoch(model, train_loader, ce_loss, focal_loss, dice_loss, optimizer, class_weights, scheduler=None, scheduler_type='CosineAnnealingWarmRestarts'):
     """
     Run one training epoch.
+    Matches Network model's pattern: returns loss_dict.
     
     Args:
         model: Neural network model
         train_loader: Training data loader
         ce_loss, focal_loss, dice_loss: Loss functions
         optimizer: Optimizer
-        class_weights: Class weights for Dice loss
+        class_weights: Class weights for Dice loss (unused but kept for compatibility)
         scheduler: Learning rate scheduler (optional)
         scheduler_type: Type of scheduler (for OneCycleLR step handling)
         
     Returns:
-        float: Average training loss for this epoch
+        dict: Dictionary with 'total', 'ce', 'focal', 'dice' losses
     """
+    import math
+    
     model.train()
-    total_loss = 0.0
+    
+    epoch_losses = defaultdict(float)
     num_batches = len(train_loader)
+    skipped_loss_nan = 0
+    skipped_grad_nan = 0
+    scheduler_warning_printed = False
     
     for batch_idx, batch in enumerate(train_loader):
         # Handle different batch formats (dict vs tuple)
         if isinstance(batch, dict):
-            images = batch['image'].cuda()
-            labels = batch['label'].cuda()
+            images = batch['image']
+            labels = batch['label']
         else:
-            images, labels = batch[0].cuda(), batch[1].cuda()
+            images, labels = batch[0], batch[1]
+        
+        if torch.cuda.is_available():
+            images = images.cuda()
+            labels = labels.cuda()
         
         # Forward pass
         predictions = model(images)
         
         # Use unified loss computation
-        loss = compute_combined_loss(predictions, labels, ce_loss, focal_loss, dice_loss)
+        loss, loss_dict = compute_combined_loss(
+            predictions, labels, ce_loss, focal_loss, dice_loss,
+            ce_weight=0.25, focal_weight=0.35, dice_weight=0.4
+        )
+        
+        # Check for NaN/Inf loss
+        if torch.isnan(loss) or torch.isinf(loss):
+            skipped_loss_nan += 1
+            continue
         
         # Backward pass and optimization
         optimizer.zero_grad()
         loss.backward()
         
+        # Check for NaN/Inf gradients before clipping
+        has_nan_grad = False
+        for param in model.parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    has_nan_grad = True
+                    break
+        
+        if has_nan_grad:
+            skipped_grad_nan += 1
+            optimizer.zero_grad()
+            continue
+        
         # Gradient clipping to prevent exploding gradients
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
         optimizer.step()
         
         # Step scheduler for OneCycleLR (step-based scheduler)
         if scheduler is not None and scheduler_type == 'OneCycleLR':
-            scheduler.step()
+            if hasattr(scheduler, 'total_steps') and scheduler.last_epoch + 1 < scheduler.total_steps:
+                scheduler.step()
+            elif hasattr(scheduler, 'total_steps') and not scheduler_warning_printed:
+                if scheduler.last_epoch + 1 >= scheduler.total_steps:
+                    print("⚠️  Scheduler reached max steps, stopping LR updates.")
+                    scheduler_warning_printed = True
         
-        total_loss += loss.item()
+        # Accumulate losses from loss_dict
+        for key, value in loss_dict.items():
+            epoch_losses[key] += value
     
-    return total_loss / num_batches
+    # Print summary only if batches were skipped
+    if skipped_loss_nan > 0 or skipped_grad_nan > 0:
+        total_skipped = skipped_loss_nan + skipped_grad_nan
+        print(f"  ⚠️  Skipped {total_skipped} batches ({skipped_loss_nan} NaN/Inf loss, {skipped_grad_nan} NaN/Inf gradients)")
+    
+    # Average losses
+    if num_batches > 0:
+        for key in epoch_losses:
+            epoch_losses[key] /= num_batches
+    else:
+        # No valid batches - return default dict with inf
+        epoch_losses['total'] = float('inf')
+        epoch_losses['ce'] = float('inf')
+        epoch_losses['focal'] = float('inf')
+        epoch_losses['dice'] = float('inf')
+    
+    return epoch_losses
 
 
-def validate_with_sliding_window(model, val_dataset, ce_loss, focal_loss, dice_loss, patch_size=224):
+def validate_model(model, val_loader, ce_loss, focal_loss, dice_loss, max_batches=None):
     """
-    Validate model using sliding window approach.
+    Validate model on validation set.
+    Matches Network model's pattern: uses DataLoader instead of sliding window.
     
     Args:
         model: Neural network model
-        val_dataset: Validation dataset
+        val_loader: Validation data loader
         ce_loss, focal_loss, dice_loss: Loss functions
-        patch_size (int): Size of patches for sliding window
+        max_batches: Optional limit on number of batches to validate
         
     Returns:
-        float: Average validation loss
+        dict: Dictionary with 'total', 'ce', 'focal', 'dice' losses
     """
-    model.eval()
-    total_loss = 0.0
-    num_samples = 0
+    import math
     
-    # Limit validation to first 50 samples for faster training
-    max_val_samples = min(50, len(val_dataset))
+    model.eval()
+    
+    epoch_losses = defaultdict(float)
+    num_batches = 0
     
     with torch.no_grad():
-        for i in range(max_val_samples):
-            sample = val_dataset[i]
-            if isinstance(sample, dict):
-                image = sample['image'].unsqueeze(0).cuda()
-                label = sample['label'].unsqueeze(0).cuda()
+        for batch_idx, batch in enumerate(val_loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+            
+            # Extract data
+            if isinstance(batch, dict):
+                images = batch['image']
+                labels = batch['label']
             else:
-                image, label = sample[0].unsqueeze(0).cuda(), sample[1].unsqueeze(0).cuda()
+                images, labels = batch[0], batch[1]
+            
+            if torch.cuda.is_available():
+                images = images.cuda()
+                labels = labels.cuda()
             
             # Forward pass
-            predictions = model(image)
+            predictions = model(images)
+            loss, loss_dict = compute_combined_loss(
+                predictions, labels, ce_loss, focal_loss, dice_loss,
+                ce_weight=0.25, focal_weight=0.35, dice_weight=0.4
+            )
             
-            # Use unified loss computation (CRITICAL FIX!)
-            loss = compute_combined_loss(predictions, label, ce_loss, focal_loss, dice_loss)
-            total_loss += loss.item()
-            num_samples += 1
+            # Check for NaN/Inf in loss_dict before accumulating
+            for key, value in loss_dict.items():
+                if isinstance(value, torch.Tensor):
+                    if torch.isnan(value).any() or torch.isinf(value).any():
+                        logging.warning(f"NaN/Inf detected in validation {key} loss: {value}")
+                        # Skip this batch if NaN/Inf detected
+                        continue
+                elif isinstance(value, (int, float)):
+                    if math.isnan(value) or math.isinf(value):
+                        logging.warning(f"NaN/Inf detected in validation {key} loss: {value}")
+                        # Skip this batch if NaN/Inf detected
+                        continue
+            
+            # Accumulate losses (only if no NaN/Inf detected)
+            for key, value in loss_dict.items():
+                epoch_losses[key] += value
+            
+            num_batches += 1
     
-    return total_loss / num_samples if num_samples > 0 else float('inf')
+    # Average losses
+    if num_batches > 0:
+        for key in epoch_losses:
+            epoch_losses[key] /= num_batches
+    else:
+        # No valid batches - return default dict with inf
+        epoch_losses['total'] = float('inf')
+        epoch_losses['ce'] = float('inf')
+        epoch_losses['focal'] = float('inf')
+        epoch_losses['dice'] = float('inf')
+    
+    return epoch_losses
 
 
 def save_best_model(model, epoch, val_loss, best_val_loss, snapshot_path,
-                    optimizer=None, scheduler=None, scaler=None):
+                    optimizer=None, scheduler=None):
     """
-    Save model + optimizer/scheduler/scaler checkpoint if validation loss improved.
+    Save model + optimizer/scheduler checkpoint if validation loss improved.
     
     Args:
         model: Neural network model
@@ -557,7 +698,6 @@ def save_best_model(model, epoch, val_loss, best_val_loss, snapshot_path,
         snapshot_path (str): Directory to save models
         optimizer: Optimizer (optional)
         scheduler: Learning rate scheduler (optional)
-        scaler: GradScaler for AMP (optional)
         
     Returns:
         tuple: (best_val_loss, improvement_made)
@@ -579,14 +719,6 @@ def save_best_model(model, epoch, val_loss, best_val_loss, snapshot_path,
             'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
             'best_val_loss': best_val_loss,
         }
-        
-        # Include scaler state if provided (AMP)
-        if scaler is not None:
-            try:
-                checkpoint['scaler_state'] = scaler.state_dict()
-            except Exception:
-                # scaler may not support state_dict in some versions; ignore safely
-                pass
         
         # Save checkpoint
         torch.save(checkpoint, best_model_path)
@@ -617,7 +749,7 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
     print("TRAINING CONFIGURATION")
     print("="*80)
     print(f"Dataset: {args.dataset}")
-    print(f"Model: {args.model}")
+    print(f"Model: Hybrid2")  # Hardcoded instead of args.model
     print(f"Batch Size: {args.batch_size}")
     print(f"Max Epochs: {args.max_epochs}")
     print(f"Learning Rate: {args.base_lr}")
@@ -639,26 +771,32 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
         args.seed
     )
     
+    # Print dataset statistics (matching Network model)
+    print(f"📊 Dataset Statistics:")
+    print(f"   - Training samples: {len(train_dataset)}")
+    print(f"   - Validation samples: {len(val_dataset)}")
+    print(f"   - Batch size: {args.batch_size * args.n_gpu}")
+    print(f"   - Steps per epoch: {len(train_loader)}\n")
+    
     # Compute class weights for balanced training
     if hasattr(train_dataset, 'mask_paths'):
-        class_weights = compute_class_weights(train_dataset, args.num_classes)
-        # REMOVED: Manual weight boosting - let proper inverse frequency work naturally
+        class_weights = compute_class_weights(train_dataset, args.num_classes, smoothing=0.1)
+        # Print class weights (matching Network model)
+        print(f"📈 Class weights computed with ENS method (smoothing=0.1)")
+        print(f"   Final weights: {class_weights.cpu().numpy()}\n")
     else:
-        class_weights = torch.ones(args.num_classes)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        class_weights = torch.ones(args.num_classes, device=device)
     
     # Create loss functions, optimizer, and scheduler
-    ce_loss, focal_loss, dice_loss = create_loss_functions(class_weights, args.num_classes)
+    ce_loss, focal_loss, dice_loss = create_loss_functions(class_weights, args.num_classes, focal_gamma=2.0)
     optimizer, scheduler = create_optimizer_and_scheduler(model, args.base_lr, args, train_loader)
     
     # Get scheduler type for training loop
     scheduler_type = getattr(args, 'scheduler_type', 'CosineAnnealingWarmRestarts')
     
-    # Mixed precision scaler (used when CUDA is available)
-    try:
-        from torch.cuda.amp import GradScaler
-        scaler = GradScaler() if torch.cuda.is_available() else None
-    except ImportError:
-        scaler = None
+    # No AMP scaler - Network model doesn't use it
+    scaler = None
     
     # Set up TensorBoard logging
     writer = SummaryWriter(os.path.join(snapshot_path, 'tensorboard_logs'))
@@ -669,6 +807,10 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
     epochs_without_improvement = 0
     
     checkpoint_path = os.path.join(snapshot_path, 'best_model_latest.pth')
+    print(f"\n🔍 Checking for checkpoint at: {checkpoint_path}")
+    print(f"   Absolute path: {os.path.abspath(checkpoint_path)}")
+    print(f"   File exists: {os.path.exists(checkpoint_path)}")
+    
     if os.path.exists(checkpoint_path):
         print(f"\n📂 Found checkpoint: {checkpoint_path}")
         print("   Attempting to resume training...")
@@ -740,14 +882,6 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
                             scheduler.step()
                         print(f"   ✓ Fast-forwarded scheduler to epoch {checkpoint.get('epoch', 0)}")
             
-            # Load scaler state
-            if scaler is not None and 'scaler_state' in checkpoint:
-                try:
-                    scaler.load_state_dict(checkpoint['scaler_state'])
-                    print("   ✓ Loaded scaler state")
-                except Exception:
-                    print("   ⚠️  Could not load scaler state, starting fresh")
-            
             # Load training state
             start_epoch = checkpoint.get('epoch', 0) + 1
             best_val_loss = checkpoint.get('best_val_loss', float('inf'))
@@ -760,7 +894,7 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
             print("   Starting training from scratch\n")
     
     # Training loop
-    patience = getattr(args, 'patience', 50)  # Early stopping patience from args or default to 50
+    patience = getattr(args, 'patience', 25)  # Default 25 (matching Network model)
     
     print("\n" + "="*80)
     print("STARTING TRAINING")
@@ -776,20 +910,26 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
         print("-" * 50)
         
         # Training phase
-        train_loss = run_training_epoch(model, train_loader, ce_loss, focal_loss, dice_loss, optimizer, class_weights, scheduler, scheduler_type)
+        train_losses = run_training_epoch(model, train_loader, ce_loss, focal_loss, dice_loss, optimizer, class_weights, scheduler, scheduler_type)
         
         # Validation phase
-        val_loss = validate_with_sliding_window(model, val_dataset, ce_loss, focal_loss, dice_loss)
+        val_losses = validate_model(model, val_loader, ce_loss, focal_loss, dice_loss)
         
-        # Log results
-        writer.add_scalar('Loss/Train', train_loss, epoch)
-        writer.add_scalar('Loss/Validation', val_loss, epoch)
-        writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
+        # Extract total losses for logging
+        train_loss = train_losses.get('total', float('inf'))
+        val_loss = val_losses.get('total', float('inf'))
+        
+        # Log results (matching network model pattern)
+        for key, value in train_losses.items():
+            writer.add_scalar(f'Train/{key}', value, epoch)
+        for key, value in val_losses.items():
+            writer.add_scalar(f'Val/{key}', value, epoch)
+        writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
         writer.add_scalar('Early_Stopping/Patience_Remaining', patience - epochs_without_improvement, epoch)
         writer.add_scalar('Early_Stopping/Epochs_Without_Improvement', epochs_without_improvement, epoch)
         
         # Print epoch summary
-        print(f"Results:")
+        print("Results:")
         print(f"  • Train Loss: {train_loss:.4f}")
         print(f"  • Validation Loss: {val_loss:.4f}")
         print(f"  • Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
@@ -818,7 +958,7 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
         # Save best model and check for improvement
         best_val_loss, improvement_made = save_best_model(
             model, epoch, val_loss, best_val_loss, snapshot_path,
-            optimizer=optimizer, scheduler=scheduler, scaler=scaler
+            optimizer=optimizer, scheduler=scheduler
         )
         
         # Early stopping logic
@@ -829,12 +969,17 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
             epochs_without_improvement += 1
             print(f"    ⚠ No improvement for {epochs_without_improvement} epochs (patience: {patience}, remaining: {patience - epochs_without_improvement})")
         
-        # Learning rate scheduling - handle different scheduler types
-        if scheduler_type == 'ReduceLROnPlateau':
-            scheduler.step(val_loss)  # ReduceLROnPlateau needs validation loss
-        elif scheduler_type != 'OneCycleLR':
-            scheduler.step()  # Other epoch-based schedulers step automatically
-        # OneCycleLR is already stepped in run_training_epoch
+        # Step scheduler per epoch (for schedulers that step per epoch, not per batch)
+        # OneCycleLR is stepped per batch in run_training_epoch
+        if scheduler_type != 'OneCycleLR':
+            if scheduler_type == 'ReduceLROnPlateau':
+                # ReduceLROnPlateau steps based on validation loss
+                import math
+                scheduler_val_loss = val_loss if not math.isinf(val_loss) else 1e6
+                scheduler.step(scheduler_val_loss)
+            else:
+                # Other epoch-based schedulers
+                scheduler.step()
         
         # Early stopping check
         if epochs_without_improvement >= patience:
@@ -850,10 +995,14 @@ def trainer_hybrid(args, model, snapshot_path, train_dataset=None, val_dataset=N
     print("\n" + "="*80)
     print("TRAINING COMPLETED")
     print("="*80)
-    print(f"Best Validation Loss: {best_val_loss:.4f}")
-    print(f"Total Epochs: {epoch+1}")
-    print(f"Models Saved To: {snapshot_path}")
-    print(f"TensorBoard Logs: {os.path.join(snapshot_path, 'tensorboard_logs')}")
+    print(f"Best Val Loss:  {best_val_loss:.4f}")
+    # Handle case where training loop didn't execute (resumed from final epoch)
+    if start_epoch >= args.max_epochs:
+        print(f"Total Epochs:   {start_epoch}")
+    else:
+        print(f"Total Epochs:   {epoch + 1}")
+    print(f"Models Saved:   {snapshot_path}")
+    print(f"TensorBoard:    {os.path.join(snapshot_path, 'tensorboard_logs')}")
     print("="*80 + "\n")
     
     writer.close()

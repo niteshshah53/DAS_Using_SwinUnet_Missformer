@@ -35,96 +35,54 @@ except ImportError:
 
 def get_model(args, config=None):
     """
-    Create and initialize the Hybrid model (hybrid1 or hybrid2).
+    Create and initialize the Hybrid2 model.
     
     Args:
-        args: Command line arguments containing model type and parameters
-        config: Configuration object (not used for Hybrid)
+        args: Command line arguments containing model parameters
+        config: Configuration object (not used for Hybrid2)
         
     Returns:
-        torch.nn.Module: Initialized Hybrid model ready for training
+        torch.nn.Module: Initialized Hybrid2 model ready for training
     """
-    # Determine which hybrid model to use
-    if args.model == 'hybrid1':
-        # Check if enhanced version is requested
-        use_enhanced = getattr(args, 'use_enhanced', False)
-        
-        if use_enhanced:
-            print("=" * 80)
-            print("🚀 Loading Hybrid1 Enhanced: EfficientNet-B4 + Swin-Unet with Transformer-CNN Hybrid Best Practices")
-            print("=" * 80)
-            from hybrid1.hybrid_model import create_hybrid_model
-            model = create_hybrid_model(
-                num_classes=args.num_classes,
-                img_size=args.img_size,
-                pretrained=True,
-                use_deep_supervision=True,
-                use_multiscale_agg=True,
-                use_smart_skip=True
-            )
-        else:
-            print("Loading Hybrid1 Baseline: EfficientNet-B4 + Swin-Unet...")
-            from hybrid1.hybrid_model import create_hybrid_model
-            model = create_hybrid_model(
-                num_classes=args.num_classes,
-                img_size=args.img_size,
-                pretrained=True
-            )
-    elif args.model == 'hybrid2':
-        # Check which decoder variant to use
-        use_baseline = getattr(args, 'use_baseline', False)
-        use_transunet = getattr(args, 'use_transunet', False)
-        use_efficientnet = getattr(args, 'use_efficientnet', False)
-        
-        if use_baseline:
-            print("=" * 80)
-            print("🚀 Loading Hybrid2 BASELINE")
-            print("=" * 80)
-            from hybrid2.model import create_hybrid2_baseline
-            model = create_hybrid2_baseline(
-                num_classes=args.num_classes,
-                img_size=args.img_size,
-                efficientnet_variant=getattr(args, 'efficientnet_variant', 'b4'),
-                use_deep_supervision=getattr(args, 'use_deep_supervision', False),
-                use_cbam=getattr(args, 'use_cbam', False),
-                use_smart_skip=getattr(args, 'use_smart_skip', False),
-                use_cross_attn=getattr(args, 'use_cross_attn', False),
-                use_multiscale_agg=getattr(args, 'use_multiscale_agg', False),
-                use_groupnorm=getattr(args, 'use_groupnorm', False),
-                use_pos_embed=getattr(args, 'use_pos_embed', True)  # Default True to match SwinUnet
-            )
-        elif use_efficientnet:
-            print("=" * 80)
-            print("🚀 Loading Hybrid2-Enhanced EfficientNet: CNN Decoder + Transformer-CNN Hybrid")
-            print("=" * 80)
-            from hybrid2.model import create_hybrid2_efficientnet
-            model = create_hybrid2_efficientnet(
-                num_classes=args.num_classes,
-                img_size=args.img_size
-            )
-        elif use_transunet:
-            print("=" * 80)
-            print("🚀 Loading Hybrid2 Enhanced: Transformer-CNN Hybrid Best Practices")
-            print("=" * 80)
-            from hybrid2.model import create_hybrid2_enhanced_full
-            model = create_hybrid2_enhanced_full(
-                num_classes=args.num_classes,
-                img_size=args.img_size
-            )
-        else:
-            print("Loading Hybrid2: Swin-EfficientNet model...")
-            print("🚀 Transformer-CNN Hybrid Best Practices: Deep Supervision ENABLED")
-            # Fallback to baseline if hybrid_model doesn't exist
-            from hybrid2.model import create_hybrid2_baseline
-            model = create_hybrid2_baseline(
-                num_classes=args.num_classes,
-                img_size=args.img_size,
-                efficientnet_variant=getattr(args, 'efficientnet_variant', 'b4'),
-                use_deep_supervision=True,  # Transformer-CNN hybrid best practice
-                # Note: use_pos_embed defaults to True (matching SwinUnet pattern)
-            )
+    use_baseline = getattr(args, 'use_baseline', False)
+    decoder_type = getattr(args, 'decoder', 'simple')
+    
+    # Simplified logic:
+    # - If --use_baseline is used without --decoder → decoder='simple' (default)
+    # - If --use_baseline is used with --decoder → use specified decoder
+    # - If --decoder is used without --use_baseline → error (caught in validate_arguments)
+    if use_baseline:
+        # use_baseline is set, use specified decoder (or 'simple' if not specified)
+        decoder_type = decoder_type  # Already set from args
     else:
-        raise ValueError(f"Unknown model: {args.model}. Use 'hybrid1' or 'hybrid2'")
+        # No use_baseline flag → error (should be caught in validate, but handle gracefully)
+        print("ERROR: --use_baseline flag is required")
+        print("Usage: --use_baseline [--decoder simple|EfficientNet-B4|ResNet50]")
+        raise ValueError("--use_baseline flag is required")
+    
+    # Handle batch norm flag (if use_batchnorm is set, disable groupnorm)
+    use_groupnorm_value = getattr(args, 'use_groupnorm', True)
+    if getattr(args, 'use_batchnorm', False):
+        use_groupnorm_value = False
+    
+    # Always use baseline with configurable decoder (flags control enhancements)
+    print("=" * 80)
+    print(f"🚀 Loading Hybrid2 with {decoder_type} Decoder")
+    print("=" * 80)
+    from hybrid2.model import create_hybrid2_baseline
+    model = create_hybrid2_baseline(
+        num_classes=args.num_classes,
+        img_size=args.img_size,
+        decoder=decoder_type,
+        efficientnet_variant=getattr(args, 'efficientnet_variant', 'b4'),
+        use_deep_supervision=getattr(args, 'use_deep_supervision', False),
+        use_cbam=getattr(args, 'use_cbam', False),
+        use_smart_skip=getattr(args, 'use_smart_skip', False),
+        use_cross_attn=getattr(args, 'use_cross_attn', False),
+        use_multiscale_agg=getattr(args, 'use_multiscale_agg', False),
+        use_groupnorm=use_groupnorm_value,
+        use_pos_embed=getattr(args, 'use_pos_embed', True)
+    )
     
     # Move to GPU if available
     if torch.cuda.is_available():
@@ -167,7 +125,7 @@ def setup_datasets(args):
             patch_size=args.img_size,
             use_patched_data=args.use_patched_data,
             manuscript=args.manuscript,
-            model_type=args.model,
+            model_type='hybrid2',  # Hardcoded since we only support hybrid2
             num_classes=num_classes
         )
         
@@ -177,7 +135,7 @@ def setup_datasets(args):
             patch_size=args.img_size,
             use_patched_data=args.use_patched_data,
             manuscript=args.manuscript,
-            model_type=args.model,
+            model_type='hybrid2',  # Hardcoded since we only support hybrid2
             num_classes=num_classes
         )
         
@@ -191,7 +149,7 @@ def setup_datasets(args):
             patch_size=args.img_size,
             use_patched_data=args.use_patched_data,
             manuscript=args.manuscript,
-            model_type=args.model
+            model_type='hybrid2'  # Hardcoded since we only support hybrid2
         )
         
         val_dataset = DivaHisDBDataset(
@@ -200,7 +158,7 @@ def setup_datasets(args):
             patch_size=args.img_size,
             use_patched_data=args.use_patched_data,
             manuscript=args.manuscript,
-            model_type=args.model
+            model_type='hybrid2'  # Hardcoded since we only support hybrid2
         )
         
     else:
@@ -231,6 +189,36 @@ def validate_arguments(args):
     # Check if output directory is writable
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Validate decoder and use_baseline flag usage
+    use_baseline = getattr(args, 'use_baseline', False)
+    decoder_type = getattr(args, 'decoder', 'simple')
+    
+    # Rule 1: If decoder is specified (and not 'simple'), must use --use_baseline
+    if decoder_type != 'simple' and not use_baseline:
+        print(f"ERROR: --decoder {decoder_type} requires --use_baseline flag")
+        print(f"Usage: --use_baseline --decoder {decoder_type}")
+        sys.exit(1)
+    
+    # Rule 2: Enhancement flags can only be used with --use_baseline
+    enhancement_flags = [
+        ('use_deep_supervision', getattr(args, 'use_deep_supervision', False)),
+        ('use_cbam', getattr(args, 'use_cbam', False)),
+        ('use_smart_skip', getattr(args, 'use_smart_skip', False)),
+        ('use_cross_attn', getattr(args, 'use_cross_attn', False)),
+        ('use_multiscale_agg', getattr(args, 'use_multiscale_agg', False)),
+    ]
+    
+    used_enhancement_flags = [name for name, used in enhancement_flags if used]
+    if used_enhancement_flags and not use_baseline:
+        print(f"ERROR: Enhancement flags {used_enhancement_flags} require --use_baseline flag")
+        print(f"Usage: --use_baseline {' '.join([f'--{flag}' for flag in used_enhancement_flags])}")
+        sys.exit(1)
+    
+    # Rule 3: If --use_baseline is used without --decoder, set decoder='simple' automatically
+    if use_baseline and decoder_type == 'simple':
+        # This is the default case - decoder='simple' is already set
+        pass
+    
     print("All arguments validated successfully!")
 
 
@@ -241,25 +229,26 @@ def parse_arguments():
     Returns:
         argparse.Namespace: Parsed arguments
     """
-    parser = argparse.ArgumentParser(description='Hybrid Model Training for Historical Document Segmentation')
+    parser = argparse.ArgumentParser(description='Hybrid2 Model Training for Historical Document Segmentation')
     
     # Model configuration
-    parser.add_argument('--model', type=str, default='hybrid2', choices=['hybrid1', 'hybrid2'],
-                       help='Model type: hybrid1 (EfficientNet-Swin) or hybrid2 (Swin-EfficientNet)')
-    parser.add_argument('--efficientnet_variant', type=str, default='b4', choices=['b0', 'b4'],
-                       help='EfficientNet variant for hybrid2 baseline decoder (b0, b4)')
+    # Remove this line:
+    # parser.add_argument('--model', type=str, default='hybrid2', choices=['hybrid2'],
+    #                    help='Model type: hybrid2 (Swin-EfficientNet)')
     
     # Hybrid2 model variants
     parser.add_argument('--use_baseline', action='store_true', default=False,
-                       help='Use baseline Hybrid2 (Swin encoder + 2 Swin blocks bottleneck + EfficientNet decoder)')
-    parser.add_argument('--use_transunet', action='store_true', default=False,
-                       help='Use Enhanced Hybrid2 decoder (all best practices: GroupNorm, PosEmbed, CrossAttn, MultiScale)')
-    parser.add_argument('--use_efficientnet', action='store_true', default=False,
-                       help='Use Enhanced EfficientNet decoder (Pure CNN + transformer-CNN hybrid improvements, Expected IoU: 0.60-0.65)')
+                       help='Use baseline Hybrid2 (required). If used alone, defaults to simple decoder. Must be used with --decoder for other decoders.')
+    parser.add_argument('--decoder', type=str, default='simple',
+                       choices=['simple', 'EfficientNet-B4', 'ResNet50'],
+                       help='Decoder type: simple (default when --use_baseline is used alone), EfficientNet-B4, or ResNet50 (requires --use_baseline)')
+    parser.add_argument('--efficientnet_variant', type=str, default='b4', choices=['b0', 'b4'],
+                       help='EfficientNet variant for simple decoder (b0, b4). Only used when --decoder simple')
     
-    # Hybrid1 enhancement
-    parser.add_argument('--use_enhanced', action='store_true', default=False,
-                       help='Use Enhanced Hybrid1 with transformer-CNN hybrid best practices (Deep Supervision + Multi-scale Aggregation)')
+    # Remove these lines:
+    # parser.add_argument('--use_transunet', action='store_true', default=False, ...)
+    # parser.add_argument('--use_efficientnet', action='store_true', default=False, ...)
+    # parser.add_argument('--use_enhanced', action='store_true', default=False, ...)
     
     # Hybrid2 baseline enhancement flags (only used with --use_baseline)
     parser.add_argument('--use_deep_supervision', action='store_true', default=False,
@@ -272,8 +261,10 @@ def parse_arguments():
                        help='Enable cross-attention bottleneck')
     parser.add_argument('--use_multiscale_agg', action='store_true', default=False,
                        help='Enable multi-scale aggregation')
-    parser.add_argument('--use_groupnorm', action='store_true', default=False,
-                       help='Use GroupNorm instead of BatchNorm')
+    parser.add_argument('--use_groupnorm', action='store_true', default=True,
+                       help='Use GroupNorm instead of BatchNorm (default: True)')
+    parser.add_argument('--use_batchnorm', action='store_true', default=False,
+                       help='Use BatchNorm instead of GroupNorm (overrides --use_groupnorm)')
     parser.add_argument('--use_pos_embed', action='store_true', default=True,
                        help='Enable positional embeddings (default: True, matching SwinUnet pattern)')
     parser.add_argument('--no_pos_embed', dest='use_pos_embed', action='store_false',
@@ -356,7 +347,7 @@ def main():
     # Start training
     print("\n=== Starting Training ===")
     print("Dataset: {}".format(args.dataset))
-    print("Model: {}".format(args.model))
+    print("Model: Hybrid2")  # Hardcoded
     print("Batch size: {}".format(args.batch_size))
     print("Max epochs: {}".format(args.max_epochs))
     print("Learning rate: {}".format(args.base_lr))

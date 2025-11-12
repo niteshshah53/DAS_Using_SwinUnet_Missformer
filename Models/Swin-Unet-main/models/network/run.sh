@@ -1,7 +1,7 @@
 #!/bin/bash -l
-#SBATCH --job-name=h1_baseline2           
-#SBATCH --output=./UDIADS_BIB_MS/baseline2_%j.out
-#SBATCH --error=./UDIADS_BIB_MS/baseline2_%j.out
+#SBATCH --job-name=h1_baseline2_msa      
+#SBATCH --output=./UDIADS_BIB_MS/baseline2_msa_%j.out
+#SBATCH --error=./UDIADS_BIB_MS/baseline2_msa_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -39,13 +39,13 @@ export PYTHONPATH="${HOME}/.local/lib/python3.12/site-packages:${PYTHONPATH}"
 #   ✗ Deep Supervision
 #   ✗ Smart Skip Connections
 #   ✗ Fourier Feature Fusion
-#   ✗ Multi-Scale Aggregation
+#   ✓ Multi-Scale Aggregation
 # ============================================================================
 
 echo "============================================================================"
-echo "CNN-TRANSFORMER BASELINE NETWORK MODEL"
+echo "CNN-TRANSFORMER BASELINE NETWORK MODEL + MULTI-SCALE AGGREGATION"
 echo "============================================================================"
-echo "Configuration: BASELINE ONLY"
+echo "Configuration: BASELINE + MULTI-SCALE AGGREGATION"
 echo ""
 echo "Component Details:"
 echo "  ✓ EfficientNet-B4 Encoder"
@@ -54,6 +54,7 @@ echo "  ✓ Swin Transformer Decoder"
 echo "  ✓ Simple concatenation skip connections"
 echo "  ✓ Adapter mode: streaming"
 echo "  ✓ GroupNorm: enabled"
+echo "  ✓ Multi-Scale Aggregation: enabled"
 echo "  ✓ Loss: CE + Dice + Focal (0.3*CE + 0.2*Focal + 0.5*Dice)"
 echo "  ✓ Differential LR: Encoder (0.1x), Bottleneck (0.5x), Decoder (1.0x)"
 echo ""
@@ -72,10 +73,10 @@ MANUSCRIPTS=(Latin2 Latin14396 Latin16746 Syr341)
 for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
     echo ""
     echo "╔════════════════════════════════════════════════════════════════════════╗"
-    echo "║  TRAINING BASELINE: $MANUSCRIPT"
+    echo "║  TRAINING BASELINE + MULTI-SCALE AGGREGATION: $MANUSCRIPT"
     echo "╚════════════════════════════════════════════════════════════════════════╝"
     echo ""
-    echo "Configuration: BASELINE ONLY"
+    echo "Configuration: BASELINE + MULTI-SCALE AGGREGATION"
     echo "Output Directory: ./UDIADS_BIB_MS/${MANUSCRIPT}"
     echo ""
     
@@ -90,6 +91,7 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --max_epochs 300 \
         --base_lr 0.0001 \
         --patience 100 \
+        --use_multiscale_agg \
         --output_dir "./UDIADS_BIB_MS/${MANUSCRIPT}"
     
     TRAIN_EXIT_CODE=$?
@@ -104,7 +106,7 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         echo ""
         
         echo "╔════════════════════════════════════════════════════════════════════════╗"
-        echo "║  TESTING BASELINE: $MANUSCRIPT"
+        echo "║  TESTING BASELINE + MULTI-SCALE AGGREGATION: $MANUSCRIPT"
         echo "╚════════════════════════════════════════════════════════════════════════╝"
         echo ""
         echo "Test Configuration:"
@@ -121,6 +123,7 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
             --is_savenii \
             --use_tta \
             --use_crf \
+            --use_multiscale_agg \
             --output_dir "./UDIADS_BIB_MS/${MANUSCRIPT}"
         
         TEST_EXIT_CODE=$?
@@ -153,6 +156,6 @@ echo ""
 echo "============================================================================"
 echo "ALL MANUSCRIPTS PROCESSED"
 echo "============================================================================"
-echo "Configuration Used: BASELINE ONLY"
+echo "Configuration Used: BASELINE + MULTI-SCALE AGGREGATION"
 echo "Results Location: ./UDIADS_BIB_MS/"
 echo "============================================================================"
