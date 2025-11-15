@@ -395,7 +395,9 @@ def compute_combined_loss(predictions, labels, ce_loss, focal_loss, dice_loss,
         loss_dict['dice'] = loss_dice.item()
         
         # Auxiliary losses with exponentially decaying weights (matching hybrid2 pattern)
-        aux_weights = [0.4 * (0.8 ** i) for i in range(len(aux_outputs))]
+        # Reduced weights for stability when using smart skip connections
+        # Smart skip connections + deep supervision can cause gradient explosion
+        aux_weights = [0.1 * (0.8 ** i) for i in range(len(aux_outputs))]
         aux_loss = 0.0
         
         for i, (weight, aux_output) in enumerate(zip(aux_weights, aux_outputs)):

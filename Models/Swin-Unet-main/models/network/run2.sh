@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=2nd
+#SBATCH --job-name=3rd
 #SBATCH --output=./Result/a3/baseline_smart_ds_%j.out
 #SBATCH --error=./Result/a3/baseline_smart_ds_%j.out
 #SBATCH --nodes=1
@@ -7,9 +7,6 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --time=22:00:00
 #SBATCH --gres=gpu:1
-
-#SBATCH --export=NONE
-unset SLURM_EXPORT_ENV
 
 # Load modules
 module purge
@@ -22,44 +19,54 @@ conda activate pytorch2.6-py3.12
 # Add user site-packages to PYTHONPATH to find user-installed packages like pydensecrf2
 export PYTHONPATH="${HOME}/.local/lib/python3.12/site-packages:${PYTHONPATH}"
 
+# Memory optimization: Reduce CUDA memory fragmentation
+# This is critical for smart skip connections with TTA (attention mechanisms are memory-intensive)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+
 # ============================================================================
-# BASELINE NETWORK MODEL CONFIGURATION
+# CNN-TRANSFORMER BASE MODEL + SMART SKIP CONNECTIONS + DEEP SUPERVISION CONFIGURATION
 # ============================================================================
-# Baseline Configuration:
+# Base Model Configuration (minimal components, no extra enhancements):
 #   ✓ EfficientNet-B4 Encoder
-#   ✓ Bottleneck: 2 Swin Transformer blocks (automatically enabled)
+#   ✓ Bottleneck: 2 Swin Transformer blocks (enabled)
 #   ✓ Swin Transformer Decoder
-#   ✓ Smart Skip Connections
-#   ✓ Adapter mode: streaming (default)
-#   ✓ GroupNorm: enabled (default)
+#   ✓ Fusion Method: simple (concatenation)
+#   ✓ Adapter mode: streaming (integrated adapters)
+#   ✓ GroupNorm: enabled
+#   ✓ Deep Supervision: enabled
 #   ✓ All three losses: CE + Dice + Focal
-#   ✓ Differential LR: Encoder (0.1x), Bottleneck (0.5x), Decoder (1.0x)
+#   ✓ Differential LR: Encoder (0.05x), Bottleneck (1.0x), Decoder (1.0x)
 #
-# Components Disabled (baseline):
+# Components Disabled (base model):
+#   ✗ Multi-Scale Aggregation
 #   ✗ Fourier Feature Fusion
+#   ✗ Simple Skip Connections
 # ============================================================================
 
 echo "============================================================================"
-echo "CNN-TRANSFORMER BASELINE NETWORK MODEL + SMART SKIP CONNECTIONS + DEEP SUPERVISION"
+echo "CNN-TRANSFORMER BASE MODEL + SMART SKIP CONNECTIONS + DEEP SUPERVISION"
 echo "============================================================================"
-echo "Configuration: BASELINE + SMART SKIP CONNECTIONS + DEEP SUPERVISION"
+echo "Configuration: CNN-TRANSFORMER BASE MODEL + SMART SKIP CONNECTIONS + DEEP SUPERVISION"
 echo ""
 echo "Component Details:"
 echo "  ✓ EfficientNet-B4 Encoder"
-echo "  ✓ Bottleneck: 2 Swin Transformer blocks"
+echo "  ✓ Bottleneck: 2 Swin Transformer blocks (enabled)"
 echo "  ✓ Swin Transformer Decoder"
-echo "  ✓ Smart Skip Connections"
-echo "  ✓ Adapter mode: streaming"
+echo "  ✓ Fusion Method: smart (attention-based smart skip connections)"
+echo "  ✓ Adapter mode: streaming (integrated)"
 echo "  ✓ GroupNorm: enabled"
-echo "  ✓ Loss: CE + Dice + Focal (0.3*CE + 0.2*Focal + 0.5*Dice)"
-echo "  ✓ Differential LR: Encoder (0.1x), Bottleneck (0.5x), Decoder (1.0x)"
+echo "  ✓ Deep Supervision: enabled"
+echo "  ✗ Multi-Scale Aggregation: disabled (base model)"
+echo "  ✗ Fourier Feature Fusion: disabled (using smart fusion)"
+echo "  ✗ Simple Skip Connections: disabled (using smart fusion)"
 echo ""
 echo "Training Parameters:"
-echo "  - Batch Size: 4"
+echo "  - Batch Size: 16"
 echo "  - Max Epochs: 300"
 echo "  - Learning Rate: 0.0001"
 echo "  - Scheduler: CosineAnnealingWarmRestarts"
-echo "  - Early Stopping: 100 epochs patience"
+echo "  - Early Stopping: 150 epochs patience"
 echo "============================================================================"
 echo ""
 
@@ -69,25 +76,27 @@ MANUSCRIPTS=(Latin2 Latin14396 Latin16746 Syr341)
 for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
     echo ""
     echo "╔════════════════════════════════════════════════════════════════════════╗"
-    echo "║  TRAINING BASELINE + SMART SKIP CONNECTIONS + DEEP SUPERVISION: $MANUSCRIPT"
+    echo "║  TRAINING CNN-TRANSFORMER BASE MODEL + SMART SKIP CONNECTIONS + DEEP SUPERVISION: $MANUSCRIPT"
     echo "╚════════════════════════════════════════════════════════════════════════╝"
     echo ""
-    echo "Configuration: BASELINE + SMART SKIP CONNECTIONS + DEEP SUPERVISION"
+    echo "Configuration: CNN-TRANSFORMER BASE MODEL + SMART SKIP CONNECTIONS + DEEP SUPERVISION"
     echo "Output Directory: ./Result/a3/${MANUSCRIPT}"
     echo ""
     
     python3 train.py \
-        --use_baseline \
         --dataset UDIADS_BIB \
         --udiadsbib_root "../../U-DIADS-Bib-MS_patched" \
         --manuscript ${MANUSCRIPT} \
         --use_patched_data \
         --scheduler_type CosineAnnealingWarmRestarts \
-        --batch_size 4 \
+        --batch_size 16 \
         --max_epochs 300 \
         --base_lr 0.0001 \
         --patience 150 \
+        --bottleneck \
+        --adapter_mode streaming \
         --fusion_method smart \
+        --use_groupnorm \
         --deep_supervision \
         --output_dir "./Result/a3/${MANUSCRIPT}"
     
@@ -103,24 +112,31 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         echo ""
         
         echo "╔════════════════════════════════════════════════════════════════════════╗"
-        echo "║  TESTING BASELINE + SMART SKIP CONNECTIONS + DEEP SUPERVISION: $MANUSCRIPT"
+        echo "║  TESTING CNN-TRANSFORMER BASE MODEL + SMART SKIP CONNECTIONS + DEEP SUPERVISION: $MANUSCRIPT"
         echo "╚════════════════════════════════════════════════════════════════════════╝"
         echo ""
         echo "Test Configuration:"
         echo "  ✓ Test-Time Augmentation (TTA): ENABLED"
-        echo "  ✓ CRF Post-processing: ENABLED"
+        echo "  ✗ CRF Post-processing: DISABLED"
+        echo "  - Batch Size: 1 (reduced for smart skip connections + TTA memory efficiency)"
+        echo "    Note: Smart skip connections use attention mechanisms which are memory-intensive"
         echo ""
         
+        # Use batch_size=1 for smart skip connections with TTA
+        # Smart skip connections use attention (multi-head attention) which is very memory-intensive
+        # With TTA (4 augmentations), batch_size=1 means 4 patches in memory simultaneously
         python3 test.py \
-            --use_baseline \
             --dataset UDIADS_BIB \
             --udiadsbib_root "../../U-DIADS-Bib-MS_patched" \
             --manuscript ${MANUSCRIPT} \
             --use_patched_data \
             --is_savenii \
             --use_tta \
-            --use_crf \
+            --batch_size 1 \
+            --bottleneck \
+            --adapter_mode streaming \
             --fusion_method smart \
+            --use_groupnorm \
             --deep_supervision \
             --output_dir "./Result/a3/${MANUSCRIPT}"
         
@@ -154,6 +170,6 @@ echo ""
 echo "============================================================================"
 echo "ALL MANUSCRIPTS PROCESSED"
 echo "============================================================================"
-echo "Configuration Used: BASELINE + SMART SKIP CONNECTIONS + DEEP SUPERVISION"
+echo "Configuration Used: CNN-TRANSFORMER BASE MODEL + SMART SKIP CONNECTIONS + DEEP SUPERVISION"
 echo "Results Location: ./Result/a3/"
 echo "============================================================================"
