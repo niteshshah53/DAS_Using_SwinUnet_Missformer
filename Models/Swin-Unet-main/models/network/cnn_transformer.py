@@ -65,7 +65,7 @@ class WindowAttention(nn.Module):
 
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))
         coords_flatten = torch.flatten(coords, 1)
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()
@@ -347,6 +347,20 @@ class CNNFeatureAdapter(nn.Module):
         self.fc_refine = nn.Linear(out_channels, out_channels)
         self.norm = nn.LayerNorm(out_channels)  # Always LayerNorm for tokens
         
+        # Initialize weights properly (Vision Transformer style)
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights following Vision Transformer convention."""
+        # Truncated normal initialization for Linear layers (ViT style)
+        trunc_normal_(self.fc_refine.weight, std=.02)
+        if self.fc_refine.bias is not None:
+            nn.init.constant_(self.fc_refine.bias, 0)
+        
+        # LayerNorm initialization
+        nn.init.constant_(self.norm.bias, 0)
+        nn.init.constant_(self.norm.weight, 1.0)
+        
     def forward(self, x):
         # x: (B, C, H, W)
         B, C, H, W = x.shape
@@ -428,9 +442,9 @@ class FourierFeatureFusion(nn.Module):
         feat2_2d_fp32 = feat2_2d.float()
         
         # Transform to frequency domain (apply FFT across spatial dimensions)
-        # Using rfft2 on the last two dimensions (H, W)
-        feat1_fft = torch.fft.rfft2(feat1_2d_fp32, dim=(-2, -1), norm='ortho')  # (B, C, H1, W1//2+1)
-        feat2_fft = torch.fft.rfft2(feat2_2d_fp32, dim=(-2, -1), norm='ortho')  # (B, C, H1, W1//2+1)
+        # rfft2 always operates on the last two dimensions (H, W) - no dim parameter needed
+        feat1_fft = torch.fft.rfft2(feat1_2d_fp32, norm='ortho')  # (B, C, H1, W1//2+1)
+        feat2_fft = torch.fft.rfft2(feat2_2d_fp32, norm='ortho')  # (B, C, H1, W1//2+1)
         
         # Extract magnitude and phase
         feat1_mag = torch.abs(feat1_fft)
@@ -448,7 +462,8 @@ class FourierFeatureFusion(nn.Module):
         
         # Transform back to spatial domain
         # CRITICAL: Specify the output size (s parameter) to ensure correct dimensions
-        fused_spatial = torch.fft.irfft2(fused_complex, s=(H1, W1), dim=(-2, -1), norm='ortho')
+        # irfft2 always operates on the last two dimensions - no dim parameter needed
+        fused_spatial = torch.fft.irfft2(fused_complex, s=(H1, W1), norm='ortho')
         
         # Convert back to original dtype (float16 if using mixed precision)
         fused_spatial = fused_spatial.to(original_dtype)
@@ -549,7 +564,9 @@ class SmartSkipConnectionTransformer(nn.Module):
             skip_tokens_2d = torch.nn.functional.interpolate(skip_tokens_2d, size=(h_dec, w_dec), mode='bilinear', align_corners=False)
             skip_tokens = skip_tokens_2d.permute(0, 2, 3, 1).reshape(B_dec, L_dec, dec_dim)
         fused = torch.cat([decoder_tokens, skip_tokens], dim=-1)
-        return self.fuse(fused)
+        fused_output = self.fuse(fused)
+        # Add residual connection for stable gradient flow (ResNet/Transformer style)
+        return decoder_tokens + fused_output
 
 
 class SimpleSkipConnectionTransformer(nn.Module):
@@ -691,14 +708,12 @@ class EfficientNetSwinUNet(nn.Module):
         
         self.norm = norm_layer(self.decoder_dims[-1])
         if self.use_bottleneck:
-            # Calculate stochastic drop_path matching SwinUnet
-            # SwinUnet uses depths=[2, 2, 2, 2] for encoder, bottleneck is last 2 blocks
-            # dpr = linspace(0, drop_path_rate, sum(depths)) = linspace(0, 0.1, 8)
-            # Bottleneck uses last 2 values: dpr[6:8] ≈ [0.086, 0.1]
-            depths_encoder = [2, 2, 2, 2]  # Matching SwinUnet encoder depths
-            dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths_encoder))]
-            # Bottleneck is the last encoder layer (layer 3), uses last 2 blocks
-            bottleneck_drop_path = dpr[sum(depths_encoder[:3]):sum(depths_encoder[:4])]
+            # Calculate stochastic drop_path using decoder depths for consistency
+            # The bottleneck is part of the decoder path, so use decoder depths
+            # dpr = linspace(0, drop_path_rate, sum(depths_decoder))
+            dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths_decoder))]
+            # Bottleneck uses the last 2 blocks (since bottleneck depth=2)
+            bottleneck_drop_path = dpr[-2:]
             
             # 2 Swin blocks at 7x7 with dim=768, heads=24 (matching SwinUnet)
             self.bottleneck_layer = BasicLayer(
@@ -864,13 +879,26 @@ class EfficientNetSwinUNet(nn.Module):
         if use_deep_supervision:
             # Stages 1, 2, 3 have dimensions: [384, 192, 96]
             aux_dims = [int(embed_dim * 2 ** (3-i)) for i in range(1, 4)]  # [384, 192, 96]
-            self.aux_heads = nn.ModuleList([
-                nn.Sequential(
-                    norm_layer(dim),
-                    nn.Linear(dim, num_classes)
-                ) for dim in aux_dims
-            ])
-            print("🚀 Deep Supervision enabled: 3 auxiliary outputs")
+            # Use convolutional heads to maintain spatial structure (U-Net++ style)
+            if use_groupnorm:
+                self.aux_heads = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Conv2d(dim, dim, 3, padding=1, bias=False),
+                        get_norm_layer(dim, 'group'),
+                        nn.ReLU(inplace=True),
+                        nn.Conv2d(dim, num_classes, 1)
+                    ) for dim in aux_dims
+                ])
+            else:
+                self.aux_heads = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Conv2d(dim, dim, 3, padding=1, bias=False),
+                        nn.BatchNorm2d(dim),
+                        nn.ReLU(inplace=True),
+                        nn.Conv2d(dim, num_classes, 1)
+                    ) for dim in aux_dims
+                ])
+            print("🚀 Deep Supervision enabled: 3 auxiliary outputs (convolutional heads)")
             print(f"   Aux dims: {aux_dims}")
         
         self.apply(self._init_weights)
@@ -983,8 +1011,8 @@ class EfficientNetSwinUNet(nn.Module):
                     proj_feat = proj_feat.view(B_f, h_f, w_f, C)  # C is bottleneck_dim (768)
                     proj_feat = proj_feat.permute(0, 3, 1, 2)  # [B, C, H, W]
                     proj_feat = F.interpolate(proj_feat, size=(h, w), mode='bilinear', align_corners=False)
-                    proj_feat = proj_feat.permute(0, 2, 3, 1).contiguous()  # [B, H, W, C]
-                    proj_feat = proj_feat.view(B, -1, C)  # [B, L, bottleneck_dim]
+                    proj_feat = proj_feat.permute(0, 2, 3, 1)  # [B, H, W, C] - interpolate output is already contiguous
+                    proj_feat = proj_feat.reshape(B, -1, C)  # [B, L, bottleneck_dim] - reshape handles non-contiguous
                     
                     projected.append(proj_feat)
                 
@@ -1052,7 +1080,7 @@ class EfficientNetSwinUNet(nn.Module):
     def process_aux_outputs(self, aux_features):
         """
         Process auxiliary features for deep supervision.
-        Matches hybrid2's pattern: uses scale_factor for upsampling.
+        Uses convolutional heads to maintain spatial structure (U-Net++ style).
         
         Args:
             aux_features: List of 3 intermediate features [stage1, stage2, stage3]
@@ -1071,16 +1099,16 @@ class EfficientNetSwinUNet(nn.Module):
         scale_factors = [16, 8, 4]
         
         for i, aux_feat in enumerate(aux_features):
-            # aux_feat: [B, L, C]
+            # aux_feat: [B, L, C] - token format
             B, L, C = aux_feat.shape
             
-            # Apply auxiliary head
-            aux_out = self.aux_heads[i](aux_feat)  # [B, L, num_classes]
-            
-            # Reshape to spatial
+            # Reshape tokens to spatial format first to maintain spatial structure
             h = w = int(L ** 0.5)
-            aux_out = aux_out.view(B, h, w, self.num_classes)
-            aux_out = aux_out.permute(0, 3, 1, 2)  # [B, num_classes, h, w]
+            aux_feat_spatial = aux_feat.view(B, h, w, C)
+            aux_feat_spatial = aux_feat_spatial.permute(0, 3, 1, 2)  # [B, C, h, w]
+            
+            # Apply convolutional auxiliary head (maintains spatial structure)
+            aux_out = self.aux_heads[i](aux_feat_spatial)  # [B, num_classes, h, w]
             
             # Upsample using scale_factor (matching hybrid2 pattern)
             aux_out = F.interpolate(aux_out, scale_factor=scale_factors[i], 

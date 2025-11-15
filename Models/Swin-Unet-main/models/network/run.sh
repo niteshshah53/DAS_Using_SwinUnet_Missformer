@@ -1,7 +1,7 @@
 #!/bin/bash -l
-#SBATCH --job-name=h1_baseline2_msa      
-#SBATCH --output=./UDIADS_BIB_MS/baseline2_msa_%j.out
-#SBATCH --error=./UDIADS_BIB_MS/baseline2_msa_%j.out
+#SBATCH --job-name=1st      
+#SBATCH --output=./Result/a1/baseline_%j.out
+#SBATCH --error=./Result/a1/baseline_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -22,48 +22,53 @@ conda activate pytorch2.6-py3.12
 # Add user site-packages to PYTHONPATH to find user-installed packages like pydensecrf2
 export PYTHONPATH="${HOME}/.local/lib/python3.12/site-packages:${PYTHONPATH}"
 
+# Memory optimization: Reduce CUDA memory fragmentation
+# This helps prevent OOM errors during TTA (Test-Time Augmentation) which processes 4 augmentations at once
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # ============================================================================
-# BASELINE NETWORK MODEL CONFIGURATION
+# BASE NETWORK MODEL CONFIGURATION
 # ============================================================================
-# Baseline Configuration:
+# Base Model Configuration (minimal components, no extra enhancements):
 #   ✓ EfficientNet-B4 Encoder
-#   ✓ Bottleneck: 2 Swin Transformer blocks (automatically enabled)
+#   ✓ Bottleneck: 2 Swin Transformer blocks (enabled)
 #   ✓ Swin Transformer Decoder
-#   ✓ Simple concatenation skip connections
-#   ✓ Adapter mode: streaming (default)
-#   ✓ GroupNorm: enabled (default)
+#   ✓ Fusion Method: simple (concatenation)
+#   ✓ Adapter mode: streaming (integrated adapters)
+#   ✓ GroupNorm: enabled
 #   ✓ All three losses: CE + Dice + Focal
-#   ✓ Differential LR: Encoder (0.1x), Bottleneck (0.5x), Decoder (1.0x)
+#   ✓ Differential LR: Encoder (0.05x), Bottleneck (1.0x), Decoder (1.0x)
 #
-# Components Disabled (baseline):
+# Components Disabled (base model):
 #   ✗ Deep Supervision
-#   ✗ Smart Skip Connections
+#   ✗ Multi-Scale Aggregation
 #   ✗ Fourier Feature Fusion
-#   ✓ Multi-Scale Aggregation
+#   ✗ Smart Skip Connections
 # ============================================================================
 
 echo "============================================================================"
-echo "CNN-TRANSFORMER BASELINE NETWORK MODEL + MULTI-SCALE AGGREGATION"
+echo "CNN-TRANSFORMER BASE NETWORK MODEL"
 echo "============================================================================"
-echo "Configuration: BASELINE + MULTI-SCALE AGGREGATION"
+echo "Configuration: CNN-TRANSFORMER BASE MODEL (No Extra Components)"
 echo ""
 echo "Component Details:"
 echo "  ✓ EfficientNet-B4 Encoder"
-echo "  ✓ Bottleneck: 2 Swin Transformer blocks"
+echo "  ✓ Bottleneck: 2 Swin Transformer blocks (enabled)"
 echo "  ✓ Swin Transformer Decoder"
-echo "  ✓ Simple concatenation skip connections"
-echo "  ✓ Adapter mode: streaming"
+echo "  ✓ Fusion Method: simple (concatenation)"
+echo "  ✓ Adapter mode: streaming (integrated)"
 echo "  ✓ GroupNorm: enabled"
-echo "  ✓ Multi-Scale Aggregation: enabled"
-echo "  ✓ Loss: CE + Dice + Focal (0.3*CE + 0.2*Focal + 0.5*Dice)"
-echo "  ✓ Differential LR: Encoder (0.1x), Bottleneck (0.5x), Decoder (1.0x)"
+echo "  ✗ Deep Supervision: disabled (base model)"
+echo "  ✗ Multi-Scale Aggregation: disabled (base model)"
+echo "  ✗ Fourier Feature Fusion: disabled (using simple fusion)"
+echo "  ✗ Smart Skip Connections: disabled (using simple fusion)"
 echo ""
 echo "Training Parameters:"
-echo "  - Batch Size: 4"
+echo "  - Batch Size: 12"
 echo "  - Max Epochs: 300"
 echo "  - Learning Rate: 0.0001"
 echo "  - Scheduler: CosineAnnealingWarmRestarts"
-echo "  - Early Stopping: 100 epochs patience"
+echo "  - Early Stopping: 150 epochs patience"
 echo "============================================================================"
 echo ""
 
@@ -73,26 +78,28 @@ MANUSCRIPTS=(Latin2 Latin14396 Latin16746 Syr341)
 for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
     echo ""
     echo "╔════════════════════════════════════════════════════════════════════════╗"
-    echo "║  TRAINING BASELINE + MULTI-SCALE AGGREGATION: $MANUSCRIPT"
+    echo "║  TRAINING CNN-TRANSFORMER BASE MODEL: $MANUSCRIPT"
     echo "╚════════════════════════════════════════════════════════════════════════╝"
     echo ""
-    echo "Configuration: BASELINE + MULTI-SCALE AGGREGATION"
-    echo "Output Directory: ./UDIADS_BIB_MS/${MANUSCRIPT}"
+    echo "Configuration: CNN-TRANSFORMER BASE MODEL (No Extra Components)"
+    echo "Output Directory: ./Result/a1/${MANUSCRIPT}"
     echo ""
     
     python3 train.py \
-        --use_baseline \
         --dataset UDIADS_BIB \
         --udiadsbib_root "../../U-DIADS-Bib-MS_patched" \
         --manuscript ${MANUSCRIPT} \
         --use_patched_data \
         --scheduler_type CosineAnnealingWarmRestarts \
-        --batch_size 4 \
+        --batch_size 32 \
         --max_epochs 300 \
         --base_lr 0.0001 \
-        --patience 100 \
-        --use_multiscale_agg \
-        --output_dir "./UDIADS_BIB_MS/${MANUSCRIPT}"
+        --patience 150 \
+        --bottleneck \
+        --adapter_mode streaming \
+        --fusion_method simple \
+        --use_groupnorm \
+        --output_dir "./Result/a1/${MANUSCRIPT}"
     
     TRAIN_EXIT_CODE=$?
     
@@ -106,25 +113,30 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         echo ""
         
         echo "╔════════════════════════════════════════════════════════════════════════╗"
-        echo "║  TESTING BASELINE + MULTI-SCALE AGGREGATION: $MANUSCRIPT"
+        echo "║  TESTING CNN-TRANSFORMER BASE MODEL: $MANUSCRIPT"
         echo "╚════════════════════════════════════════════════════════════════════════╝"
         echo ""
         echo "Test Configuration:"
         echo "  ✓ Test-Time Augmentation (TTA): ENABLED"
-        echo "  ✓ CRF Post-processing: ENABLED"
+        echo "  ✗ CRF Post-processing: DISABLED"
+        echo "  - Batch Size: 8 (reduced for TTA memory efficiency)"
         echo ""
         
+        # Use smaller batch size for testing to avoid OOM with TTA (4 augmentations per patch = 4x memory)
+        # TTA processes 4 augmentations at once, so batch_size=8 means 32 patches in memory simultaneously
         python3 test.py \
-            --use_baseline \
             --dataset UDIADS_BIB \
             --udiadsbib_root "../../U-DIADS-Bib-MS_patched" \
             --manuscript ${MANUSCRIPT} \
             --use_patched_data \
             --is_savenii \
             --use_tta \
-            --use_crf \
-            --use_multiscale_agg \
-            --output_dir "./UDIADS_BIB_MS/${MANUSCRIPT}"
+            --batch_size 4 \
+            --bottleneck \
+            --adapter_mode streaming \
+            --fusion_method simple \
+            --use_groupnorm \
+            --output_dir "./Result/a1/${MANUSCRIPT}"
         
         TEST_EXIT_CODE=$?
         
@@ -156,6 +168,6 @@ echo ""
 echo "============================================================================"
 echo "ALL MANUSCRIPTS PROCESSED"
 echo "============================================================================"
-echo "Configuration Used: BASELINE + MULTI-SCALE AGGREGATION"
-echo "Results Location: ./UDIADS_BIB_MS/"
+echo "Configuration Used: CNN-TRANSFORMER BASE MODEL (No Extra Components)"
+echo "Results Location: ./Result/a1/"
 echo "============================================================================"

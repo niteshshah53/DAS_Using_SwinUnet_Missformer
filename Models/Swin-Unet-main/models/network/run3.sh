@@ -1,7 +1,7 @@
 #!/bin/bash -l
-#SBATCH --job-name=h1_baseline2_smart
-#SBATCH --output=./a1/baseline2_smart_%j.out
-#SBATCH --error=./a1/baseline2_smart_%j.out
+#SBATCH --job-name=3rd
+#SBATCH --output=./Result/a4/baseline_smart_ds_msa_%j.out
+#SBATCH --error=./Result/a4/baseline_smart_ds_msa_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -36,15 +36,13 @@ export PYTHONPATH="${HOME}/.local/lib/python3.12/site-packages:${PYTHONPATH}"
 #   ✓ Differential LR: Encoder (0.1x), Bottleneck (0.5x), Decoder (1.0x)
 #
 # Components Disabled (baseline):
-#   ✗ Deep Supervision
-#   ✗ Fourier Feature Fusion
-#   ✓ Multi-Scale Aggregation
+#   ✓ Fourier Feature Fusion
 # ============================================================================
 
 echo "============================================================================"
-echo "CNN-TRANSFORMER BASELINE NETWORK MODEL + SMART SKIP CONNECTIONS"
+echo "CNN-TRANSFORMER BASELINE NETWORK MODEL + SMART SKIP CONNECTIONS + DEEP SUPERVISION + MULTI-SCALE AGGREGATION"
 echo "============================================================================"
-echo "Configuration: BASELINE + SMART SKIP CONNECTIONS"
+echo "Configuration: BASELINE + SMART SKIP CONNECTIONS + DEEP SUPERVISION + MULTI-SCALE AGGREGATION"
 echo ""
 echo "Component Details:"
 echo "  ✓ EfficientNet-B4 Encoder"
@@ -53,7 +51,6 @@ echo "  ✓ Swin Transformer Decoder"
 echo "  ✓ Smart Skip Connections"
 echo "  ✓ Adapter mode: streaming"
 echo "  ✓ GroupNorm: enabled"
-echo "  ✓ Smart Skip Connections: enabled"
 echo "  ✓ Loss: CE + Dice + Focal (0.3*CE + 0.2*Focal + 0.5*Dice)"
 echo "  ✓ Differential LR: Encoder (0.1x), Bottleneck (0.5x), Decoder (1.0x)"
 echo ""
@@ -62,7 +59,7 @@ echo "  - Batch Size: 4"
 echo "  - Max Epochs: 300"
 echo "  - Learning Rate: 0.0001"
 echo "  - Scheduler: CosineAnnealingWarmRestarts"
-echo "  - Early Stopping: 100 epochs patience"
+echo "  - Early Stopping: 150 epochs patience"
 echo "============================================================================"
 echo ""
 
@@ -72,11 +69,11 @@ MANUSCRIPTS=(Latin2 Latin14396 Latin16746 Syr341)
 for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
     echo ""
     echo "╔════════════════════════════════════════════════════════════════════════╗"
-    echo "║  TRAINING BASELINE + SMART SKIP CONNECTIONS: $MANUSCRIPT"
+    echo "║  TRAINING BASELINE + SMART SKIP CONNECTIONS + DEEP SUPERVISION + MULTI-SCALE AGGREGATION: $MANUSCRIPT"
     echo "╚════════════════════════════════════════════════════════════════════════╝"
     echo ""
-    echo "Configuration: BASELINE + SMART SKIP CONNECTIONS"
-    echo "Output Directory: ./a1/${MANUSCRIPT}"
+    echo "Configuration: BASELINE + SMART SKIP CONNECTIONS + DEEP SUPERVISION + MULTI-SCALE AGGREGATION"
+    echo "Output Directory: ./Result/a4/${MANUSCRIPT}"
     echo ""
     
     python3 train.py \
@@ -89,9 +86,11 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         --batch_size 4 \
         --max_epochs 300 \
         --base_lr 0.0001 \
-        --patience 100 \
+        --patience 150 \
         --fusion_method smart \
-        --output_dir "./a1/${MANUSCRIPT}"
+        --deep_supervision \
+        --use_multiscale_agg \
+        --output_dir "./Result/a4/${MANUSCRIPT}"
     
     TRAIN_EXIT_CODE=$?
     
@@ -105,7 +104,7 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
         echo ""
         
         echo "╔════════════════════════════════════════════════════════════════════════╗"
-        echo "║  TESTING BASELINE + SMART SKIP CONNECTIONS: $MANUSCRIPT"
+        echo "║  TESTING BASELINE + SMART SKIP CONNECTIONS + DEEP SUPERVISION + MULTI-SCALE AGGREGATION: $MANUSCRIPT"
         echo "╚════════════════════════════════════════════════════════════════════════╝"
         echo ""
         echo "Test Configuration:"
@@ -123,8 +122,10 @@ for MANUSCRIPT in "${MANUSCRIPTS[@]}"; do
             --use_tta \
             --use_crf \
             --fusion_method smart \
-            --output_dir "./a1/${MANUSCRIPT}"
-        
+            --deep_supervision \
+            --use_multiscale_agg \
+            --output_dir "./Result/a4/${MANUSCRIPT}"
+
         TEST_EXIT_CODE=$?
         
         if [ $TEST_EXIT_CODE -eq 0 ]; then
@@ -155,6 +156,6 @@ echo ""
 echo "============================================================================"
 echo "ALL MANUSCRIPTS PROCESSED"
 echo "============================================================================"
-echo "Configuration Used: BASELINE + SMART SKIP CONNECTIONS"
-echo "Results Location: ./a1/"
+echo "Configuration Used: BASELINE + SMART SKIP CONNECTIONS + DEEP SUPERVISION + MULTI-SCALE AGGREGATION"
+echo "Results Location: ./Result/a4/"
 echo "============================================================================"

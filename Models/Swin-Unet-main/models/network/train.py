@@ -37,6 +37,8 @@ def get_model(args, config):
     """
     Create and initialize the CNN-Transformer model.
     
+    All architecture flags are independent and can be combined freely.
+    
     Args:
         args: Command line arguments containing model type and parameters
         config: Configuration object with model settings (not used for CNN-Transformer)
@@ -47,49 +49,41 @@ def get_model(args, config):
     print("Loading CNN-Transformer model...")
     from vision_transformer_cnn import CNNTransformerUnet as ViT_seg
     
-    use_baseline = getattr(args, 'use_baseline', False)
+    # Get all model configuration from args (all flags are independent)
+    use_bottleneck = getattr(args, 'bottleneck', True)
+    adapter_mode = getattr(args, 'adapter_mode', 'streaming')
+    fusion_method = getattr(args, 'fusion_method', 'simple')
+    use_deep_supervision = getattr(args, 'deep_supervision', False)
+    use_multiscale_agg = getattr(args, 'use_multiscale_agg', False)
+    use_groupnorm = getattr(args, 'use_groupnorm', True)
     
-    if use_baseline:
-        print("=" * 80)
-        print("🚀 Loading CNN-Transformer BASELINE")
-        print("=" * 80)
-        print("Baseline Configuration:")
-        print("  ✓ EfficientNet-B4 Encoder")
-        print("  ✓ Bottleneck: 2 Swin Transformer blocks")
-        print("  ✓ Swin Transformer Decoder")
-        print("  ✓ Simple concatenation skip connections")
-        print("  ✓ Adapter mode: streaming (default)")
-        print("  ✓ GroupNorm: {}".format(getattr(args, 'use_groupnorm', True)))
-        print("=" * 80)
-        
-        # Baseline defaults
-        adapter_mode = 'streaming'  # Default for baseline
-        use_bottleneck = True  # Always enabled for baseline
-        fusion_method = getattr(args, 'fusion_method', 'simple')
-        
-        model = ViT_seg(
-            None, 
-            img_size=args.img_size, 
-            num_classes=args.num_classes,
-            use_deep_supervision=getattr(args, 'deep_supervision', False),
-            fusion_method=fusion_method,
-            use_bottleneck=use_bottleneck,
-            adapter_mode=adapter_mode,
-            use_multiscale_agg=getattr(args, 'use_multiscale_agg', False),
-            use_groupnorm=getattr(args, 'use_groupnorm', True)  # Default True for baseline
-        )
-    else:
-        # Original non-baseline mode (backward compatibility)
-        model = ViT_seg(
-            None, 
-            img_size=args.img_size, 
-            num_classes=args.num_classes,
-            use_deep_supervision=getattr(args, 'deep_supervision', False),
-            fusion_method=getattr(args, 'fusion_method', 'simple'),
-            use_bottleneck=getattr(args, 'bottleneck', False),
-            adapter_mode=getattr(args, 'adapter_mode', 'external'),
-            use_multiscale_agg=getattr(args, 'use_multiscale_agg', False)
-        )
+    # Print configuration
+    print("=" * 80)
+    print("🚀 Loading CNN-Transformer Model")
+    print("=" * 80)
+    print("Model Configuration:")
+    print("  ✓ EfficientNet-B4 Encoder")
+    print(f"  ✓ Bottleneck: {'Enabled' if use_bottleneck else 'Disabled'}")
+    print("  ✓ Swin Transformer Decoder")
+    print(f"  ✓ Fusion Method: {fusion_method}")
+    print(f"  ✓ Adapter Mode: {adapter_mode}")
+    print(f"  ✓ Deep Supervision: {'Enabled' if use_deep_supervision else 'Disabled'}")
+    print(f"  ✓ Multi-Scale Aggregation: {'Enabled' if use_multiscale_agg else 'Disabled'}")
+    print(f"  ✓ Normalization: {'GroupNorm' if use_groupnorm else 'LayerNorm'}")
+    print("=" * 80)
+    
+    # Create model with all flags (all independent and compatible)
+    model = ViT_seg(
+        None, 
+        img_size=args.img_size, 
+        num_classes=args.num_classes,
+        use_deep_supervision=use_deep_supervision,
+        fusion_method=fusion_method,
+        use_bottleneck=use_bottleneck,
+        adapter_mode=adapter_mode,
+        use_multiscale_agg=use_multiscale_agg,
+        use_groupnorm=use_groupnorm
+    )
     
     # Move to GPU if available
     if torch.cuda.is_available():
@@ -126,9 +120,17 @@ def setup_datasets(args):
         # Update args with correct number of classes
         args.num_classes = num_classes
         
+        # Handle patched data path: add _patched suffix if use_patched_data=True and path doesn't already have it
+        root_dir = args.udiadsbib_root
+        if args.use_patched_data and not root_dir.endswith('_patched'):
+            root_dir = root_dir + '_patched'
+            print(f"Using patched data: adjusted root directory to {root_dir}")
+        elif not args.use_patched_data and root_dir.endswith('_patched'):
+            print(f"Warning: root directory ends with '_patched' but use_patched_data=False")
+        
         # Create datasets
         train_dataset = UDiadsBibDataset(
-            root_dir=args.udiadsbib_root,
+            root_dir=root_dir,
             split='training',
             patch_size=args.img_size,
             use_patched_data=args.use_patched_data,
@@ -138,7 +140,7 @@ def setup_datasets(args):
         )
         
         val_dataset = UDiadsBibDataset(
-            root_dir=args.udiadsbib_root,
+            root_dir=root_dir,
             split='validation',
             patch_size=args.img_size,
             use_patched_data=args.use_patched_data,
@@ -151,8 +153,16 @@ def setup_datasets(args):
         print("Setting up DivaHisDB dataset...")
         args.num_classes = 4
         
+        # Handle patched data path: add _patched suffix if use_patched_data=True and path doesn't already have it
+        root_dir = args.divahisdb_root
+        if args.use_patched_data and not root_dir.endswith('_patched'):
+            root_dir = root_dir + '_patched'
+            print(f"Using patched data: adjusted root directory to {root_dir}")
+        elif not args.use_patched_data and root_dir.endswith('_patched'):
+            print(f"Warning: root directory ends with '_patched' but use_patched_data=False")
+        
         train_dataset = DivaHisDBDataset(
-            root_dir=args.divahisdb_root,
+            root_dir=root_dir,
             split='training',
             patch_size=args.img_size,
             use_patched_data=args.use_patched_data,
@@ -161,7 +171,7 @@ def setup_datasets(args):
         )
         
         val_dataset = DivaHisDBDataset(
-            root_dir=args.divahisdb_root,
+            root_dir=root_dir,
             split='validation',
             patch_size=args.img_size,
             use_patched_data=args.use_patched_data,
@@ -197,26 +207,6 @@ def validate_arguments(args):
     # Check if output directory is writable
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Validate baseline flag usage
-    use_baseline = getattr(args, 'use_baseline', False)
-    
-    # Component flags that should only work with --use_baseline
-    component_flags = [
-        ('use_deep_supervision', getattr(args, 'deep_supervision', False)),
-        ('use_fourier_fusion', getattr(args, 'fusion_method', 'simple') == 'fourier'),
-        ('use_smart_fusion', getattr(args, 'fusion_method', 'simple') == 'smart'),
-        ('use_multiscale_agg', getattr(args, 'use_multiscale_agg', False)),
-        ('use_groupnorm', getattr(args, 'use_groupnorm', False)),
-    ]
-    
-    # Check if component flags are used without --use_baseline
-    if not use_baseline:
-        used_flags = [name for name, used in component_flags if used]
-        if used_flags:
-            print(f"ERROR: Component flags {used_flags} can only be used with --use_baseline flag")
-            print("Please add --use_baseline to enable these features")
-            sys.exit(1)
-    
     print("All arguments validated successfully!")
 
 
@@ -233,44 +223,58 @@ def parse_arguments():
     parser.add_argument('--img_size', type=int, default=224, help='Input image size')
     parser.add_argument('--num_classes', type=int, default=5, help='Number of classes')
     
-    # Baseline flag (similar to hybrid2)
-    parser.add_argument('--use_baseline', action='store_true', default=False,
-                       help='Use baseline CNN-Transformer (EfficientNet-B4 encoder + bottleneck + Swin decoder)')
-    
     # Dataset configuration
     parser.add_argument('--dataset', type=str, default='UDIADS_BIB', 
                        choices=['UDIADS_BIB', 'DIVAHISDB'], help='Dataset to use')
-    parser.add_argument('--udiadsbib_root', type=str, default='U-DIADS-Bib-FS_patched',
-                       help='Root directory for UDIADS_BIB dataset')
+    parser.add_argument('--udiadsbib_root', type=str, default='U-DIADS-Bib-FS',
+                       help='Root directory for UDIADS_BIB dataset (if using patched data, use path ending with _patched, e.g., U-DIADS-Bib-FS_patched)')
     parser.add_argument('--divahisdb_root', type=str, default='DIVAHISDB',
-                       help='Root directory for DIVAHISDB dataset')
+                       help='Root directory for DIVAHISDB dataset (if using patched data, use path ending with _patched)')
     parser.add_argument('--manuscript', type=str, default='Syr341FS',
                        help='Manuscript to train on')
     parser.add_argument('--use_patched_data', action='store_true', default=True,
-                       help='Use pre-generated patches')
+                       help='Use pre-generated patches (expects root directory path ending with _patched)')
     
     # Training configuration
-    parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=8,
+                       help='Batch size per GPU (default: 8, increase if memory allows. Small batches (4) cause unstable gradients and poor GPU utilization)')
     parser.add_argument('--max_epochs', type=int, default=300, help='Maximum number of epochs')
     parser.add_argument('--base_lr', type=float, default=0.0001, help='Base learning rate')
+    parser.add_argument('--encoder_lr_factor', type=float, default=0.05,
+                       help='Learning rate multiplier for pretrained encoder (default: 0.05x base_lr, recommended: 0.05-0.2 for pretrained layers)')
     parser.add_argument('--patience', type=int, default=50, help='Early stopping patience')
     parser.add_argument('--scheduler_type', type=str, default='CosineAnnealingWarmRestarts',
                        choices=['CosineAnnealingWarmRestarts', 'OneCycleLR', 'ReduceLROnPlateau', 'CosineAnnealingLR'],
                        help='Learning rate scheduler type')
+    parser.add_argument('--warmup_epochs', type=int, default=10,
+                       help='Number of warmup epochs for learning rate scheduler (critical for transformer training stability)')
+    parser.add_argument('--val_interval', type=int, default=1,
+                       help='Validation interval in epochs (default: 1 = every epoch, set to 5 to validate every 5 epochs for faster training)')
+    parser.add_argument('--use_amp', action='store_true', default=True,
+                       help='Use automatic mixed precision (AMP) for faster training (2-3x speedup on modern GPUs)')
+    parser.add_argument('--no_amp', dest='use_amp', action='store_false',
+                       help='Disable AMP (use FP32 training)')
     parser.add_argument('--n_gpu', type=int, default=1, help='Number of GPUs')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers')
     parser.add_argument('--seed', type=int, default=1234, help='Random seed')
     
-    # Baseline enhancement flags (only used with --use_baseline)
+    # Model architecture flags (all flags are independent and can be combined freely)
+    parser.add_argument('--bottleneck', action='store_true', default=True,
+                       help='Enable bottleneck with 2 Swin Transformer blocks (default: True)')
+    parser.add_argument('--no_bottleneck', dest='bottleneck', action='store_false',
+                       help='Disable bottleneck')
+    parser.add_argument('--adapter_mode', type=str, default='streaming',
+                       choices=['external', 'streaming'],
+                       help='Adapter placement mode: external (separate adapters) or streaming (integrated) (default: streaming)')
     parser.add_argument('--deep_supervision', action='store_true', default=False, 
-                       help='Enable deep supervision with 3 auxiliary outputs (requires --use_baseline)')
+                       help='Enable deep supervision with 3 auxiliary outputs')
     parser.add_argument('--fusion_method', type=str, default='simple',
                        choices=['simple', 'fourier', 'smart'],
-                       help='Feature fusion: simple (concat), fourier (FFT-based), smart (attention-based smart skip connections) (requires --use_baseline)')
+                       help='Feature fusion method: simple (concat), fourier (FFT-based), smart (attention-based smart skip connections)')
     parser.add_argument('--use_multiscale_agg', action='store_true', default=False,
-                       help='Enable multi-scale aggregation in bottleneck (requires --use_baseline)')
+                       help='Enable multi-scale aggregation in bottleneck')
     parser.add_argument('--use_groupnorm', action='store_true', default=True,
-                       help='Use GroupNorm instead of LayerNorm (default: True for baseline, requires --use_baseline)')
+                       help='Use GroupNorm instead of LayerNorm (default: True)')
     parser.add_argument('--no_groupnorm', dest='use_groupnorm', action='store_false',
                        help='Disable GroupNorm (use LayerNorm instead)')
     
@@ -282,6 +286,12 @@ def parse_arguments():
     
     # Output configuration
     parser.add_argument('--output_dir', type=str, required=True, help='Output directory for results')
+    
+    # Checkpoint resume configuration
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint to resume from (default: auto-detect best_model_latest.pth in output_dir)')
+    parser.add_argument('--no_auto_resume', action='store_true', default=False,
+                       help='Disable automatic resume from best_model_latest.pth (start fresh training)')
     
     return parser.parse_args()
 
