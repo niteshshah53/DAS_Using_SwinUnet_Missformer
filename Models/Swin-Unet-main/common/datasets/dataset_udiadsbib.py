@@ -140,6 +140,131 @@ def strong_training_transform(img, mask, patch_size,
 def identity_transform(img, mask):
     return img, mask
 
+
+def class_aware_training_transform(image, mask_class, patch_size, use_aggressive_aug=False):
+    """
+    Class-aware training transform that applies stronger augmentation for rare classes.
+    
+    Rare classes (for U-DIADS-Bib) - from actual training statistics:
+    - Paratext (1): ~5-8% (rare)
+    - Decoration (2): ~2-3% (rare)
+    - Title (4): ~1-2% (very rare)
+    - Chapter Headings (5): ~<1% (extremely rare)
+    
+    Common classes:
+    - Background (0): ~60-70%
+    - Main Text (3): ~20-25%
+    
+    Note: Actual percentages may vary by manuscript. Check compute_class_weights() output
+    for manuscript-specific statistics.
+    
+    Args:
+        image: PIL Image
+        mask_class: numpy array of class indices (H, W)
+        patch_size: Target patch size
+        use_aggressive_aug: If True, always use aggressive augmentation (for rare class samples)
+    
+    Returns:
+        (augmented_image, augmented_mask_class)
+    """
+    # Check if mask contains rare classes and determine rarity level
+    # Rare classes: Paratext (1), Decoration (2), Title (4), Chapter Headings (5)
+    # Very rare classes: Title (4), Chapter Headings (5) - <2% frequency
+    rare_classes = {1, 2, 4, 5}
+    very_rare_classes = {4, 5}  # Title, Chapter Heading (<2% frequency)
+    
+    unique_classes = set(np.unique(mask_class))
+    has_rare_class = use_aggressive_aug or bool(rare_classes.intersection(unique_classes))
+    has_very_rare_class = use_aggressive_aug or bool(very_rare_classes.intersection(unique_classes))
+    
+    # Resize first
+    image = image.resize((patch_size, patch_size), Image.BILINEAR)
+    mask_class = Image.fromarray(mask_class.astype(np.uint8)).resize((patch_size, patch_size), Image.NEAREST)
+    mask_class = np.array(mask_class)
+    
+    # Determine augmentation probabilities and ranges based on rarity
+    # Note: Reduced aggressiveness to prevent training instability
+    # Conservative fix: Using fill=0 (Background) instead of fill=255 (ignore_index) for affine transforms
+    # Synthetic pixels are treated as Background, which is acceptable since Background is the dominant class
+    if has_very_rare_class:
+        # VERY aggressive augmentation for Title & Chapter Heading (<2% frequency)
+        # Reduced probabilities to prevent training instability
+        rotation_prob = 0.7  # Reduced from 0.8
+        flip_prob = 0.7  # Reduced from 0.8
+        color_prob = 0.6  # Reduced from 0.7
+        affine_prob = 0.2  # Reduced from 0.4 to minimize border artifacts and training instability
+        rotation_range = (-35, 35)  # Reduced from (-40, 40)
+        affine_rotation_range = (-15, 15)  # Reduced from (-18, 18)
+        translate_range = (-0.10, 0.10)  # Further reduced from (-0.12, 0.12) to minimize synthetic pixels
+        scale_range = (0.90, 1.10)  # Further reduced from (0.88, 1.12) to minimize synthetic pixels
+    elif has_rare_class:
+        # Aggressive augmentation for Paratext & Decoration (2-8% frequency)
+        rotation_prob = 0.6  # Reduced from 0.7
+        flip_prob = 0.6  # Reduced from 0.7
+        color_prob = 0.5  # Reduced from 0.6
+        affine_prob = 0.2  # Reduced from 0.3 to minimize border artifacts and training instability
+        rotation_range = (-25, 25)  # Reduced from (-30, 30)
+        affine_rotation_range = (-12, 12)  # Reduced from (-15, 15)
+        translate_range = (-0.06, 0.06)  # Further reduced from (-0.08, 0.08)
+        scale_range = (0.94, 1.06)  # Further reduced from (0.92, 1.08)
+    else:
+        # Standard augmentation for common classes (Background, Main Text)
+        rotation_prob = 0.5
+        flip_prob = 0.5
+        color_prob = 0.0
+        affine_prob = 0.0
+        rotation_range = (0, 0)  # No rotation for common classes
+        affine_rotation_range = (0, 0)
+        translate_range = (0, 0)
+        scale_range = (1.0, 1.0)
+    
+    # Apply random rotation
+    if random.random() < rotation_prob and rotation_range[1] > 0:
+        angle = random.uniform(*rotation_range)
+        image = image.rotate(angle, resample=Image.BILINEAR)
+        mask_class = Image.fromarray(mask_class.astype(np.uint8)).rotate(angle, resample=Image.NEAREST)
+        mask_class = np.array(mask_class)
+    
+    # Apply random flips
+    if random.random() < flip_prob:
+        image = image.transpose(Image.FLIP_LEFT_RIGHT)
+        mask_class = np.fliplr(mask_class)
+    if random.random() < flip_prob:
+        image = image.transpose(Image.FLIP_TOP_BOTTOM)
+        mask_class = np.flipud(mask_class)
+    
+    # Apply color jitter (only for rare classes)
+    if random.random() < color_prob:
+        jitter = tvtf.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1)
+        image = jitter(image)
+    
+    # Apply random affine (rotation, translation, scale)
+    # Only for rare classes (affine_prob > 0)
+    # Conservative fix: Use fill=0 (Background) instead of fill=255 (ignore_index) to prevent training instability
+    if random.random() < affine_prob and affine_rotation_range[1] > 0:
+        angle = random.uniform(*affine_rotation_range)
+        translate = (random.uniform(*translate_range), random.uniform(*translate_range))
+        scale = random.uniform(*scale_range)
+        image = TF.affine(image, angle=angle, translate=translate, scale=scale, shear=0, fill=0)
+        # Apply same affine to mask
+        # Use fill=0 (Background class) for mask - synthetic pixels will be treated as Background
+        # This is acceptable since Background is the dominant class and these pixels are at borders
+        # Conservative fix: No ignore_index to prevent training instability from too many ignored pixels
+        mask_pil = Image.fromarray(mask_class.astype(np.uint8))
+        mask_pil = TF.affine(mask_pil, angle=angle, translate=translate, scale=scale, shear=0, fill=0)
+        mask_class = np.array(mask_pil)
+    
+    # For common classes, apply standard 90-degree rotations if no rotation was applied
+    # (This maintains backward compatibility with standard augmentation)
+    if not has_rare_class and random.random() >= 0.5:
+        angle = random.choice([90, 180, 270])
+        image = image.rotate(angle, resample=Image.BILINEAR)
+        mask_class = Image.fromarray(mask_class.astype(np.uint8)).rotate(angle, resample=Image.NEAREST)
+        mask_class = np.array(mask_class)
+    
+    mask_class = mask_class.copy()
+    return image, mask_class
+
 # U-DIADS-Bib color to class index mapping (standard 6-class version)
 COLOR_MAP_6_CLASSES = {
     (0, 0, 0): 0,         # Background
@@ -215,7 +340,7 @@ def rgb_to_class(mask, num_classes=6):
 import glob
 
 class UDiadsBibDataset(Dataset):
-    def __init__(self, root_dir, split, transform=None, patch_size=448, stride=224, use_patched_data=False, manuscript=None, model_type=None, num_classes=6):
+    def __init__(self, root_dir, split, transform=None, patch_size=448, stride=224, use_patched_data=False, manuscript=None, model_type=None, num_classes=6, use_class_aware_aug=False):
         self.use_patched_data = use_patched_data
         self.root_dir = root_dir
         self.split = split
@@ -224,6 +349,7 @@ class UDiadsBibDataset(Dataset):
         self.manuscript = manuscript
         self.model_type = model_type
         self.num_classes = num_classes
+        self.use_class_aware_aug = use_class_aware_aug
         
         # Set up the transform (no lambdas, only top-level functions)
         if transform is None:
@@ -235,22 +361,32 @@ class UDiadsBibDataset(Dataset):
                 else:
                     from datasets.sstrans_transforms import sstrans_validation_transform
                     self.transform = sstrans_validation_transform(patch_size=patch_size)
-            elif model_type and model_type.lower() in ['hybrid1', 'hybrid2']:
+            elif model_type and model_type.lower() in ['network', 'hybrid2']:
                 # Use simple transforms like SwinUnet (no complex augmentation)
+                # Note: 'network' is the new name for the model previously called 'hybrid1'
                 if split == 'training':
-                    # bind patch_size so the transform is a picklable top-level callable
-                    self.transform = partial(training_transform, patch_size=patch_size)
+                    # Use class-aware augmentation if enabled, otherwise standard
+                    if use_class_aware_aug:
+                        self.transform = partial(class_aware_training_transform, patch_size=patch_size)
+                    else:
+                        # bind patch_size so the transform is a picklable top-level callable
+                        self.transform = partial(training_transform, patch_size=patch_size)
                 else:
                     self.transform = identity_transform
             else:
-                # Default transforms for other models. For the 'swinunet' / network
-                # model we use stronger augmentations to improve generalization.
+                # Default transforms for other models. For the 'network' model
+                # (previously called 'hybrid1') we use stronger augmentations to improve generalization.
                 if split == 'training':
-                    # bind patch_size so the transform is a picklable top-level callable
-                    if model_type and model_type.lower() == 'swinunet':
-                        self.transform = partial(strong_training_transform, patch_size=patch_size)
+                    # Use class-aware augmentation if enabled
+                    if use_class_aware_aug:
+                        self.transform = partial(class_aware_training_transform, patch_size=patch_size)
                     else:
-                        self.transform = partial(training_transform, patch_size=patch_size)
+                        # bind patch_size so the transform is a picklable top-level callable
+                        # Network model uses EfficientNet-B4 encoder, so use strong augmentation
+                        if model_type and model_type.lower() == 'network':
+                            self.transform = partial(strong_training_transform, patch_size=patch_size)
+                        else:
+                            self.transform = partial(training_transform, patch_size=patch_size)
                 else:
                     self.transform = identity_transform
         else:
@@ -404,8 +540,11 @@ class UDiadsBibDataset(Dataset):
                 image_patch, mask_class = self.transform(image_patch, mask_class)
                 image_tensor = TF.to_tensor(image_patch)
                 
-                # Apply ImageNet normalization for Hybrid1 (EfficientNet encoder)
-                if self.model_type and self.model_type.lower() == 'hybrid1':
+                # Apply ImageNet normalization for models with EfficientNet encoder
+                # Network model uses EfficientNet-B4 encoder (pretrained on ImageNet)
+                # Note: 'network' is the new name for the model previously called 'hybrid1'
+                # Hybrid2 uses Swin encoder, so it doesn't need ImageNet normalization
+                if self.model_type and self.model_type.lower() in ['network', 'swinunet']:
                     image_tensor = TF.normalize(
                         image_tensor,
                         mean=[0.485, 0.456, 0.406],  # ImageNet mean
@@ -433,8 +572,11 @@ class UDiadsBibDataset(Dataset):
                 image, mask_class = self.transform(image, mask_class)
                 image_tensor = TF.to_tensor(image)
                 
-                # Apply ImageNet normalization for Hybrid1 (EfficientNet encoder)
-                if self.model_type and self.model_type.lower() == 'hybrid1':
+                # Apply ImageNet normalization for models with EfficientNet encoder
+                # Network model uses EfficientNet-B4 encoder (pretrained on ImageNet)
+                # Note: 'network' is the new name for the model previously called 'hybrid1'
+                # Hybrid2 uses Swin encoder, so it doesn't need ImageNet normalization
+                if self.model_type and self.model_type.lower() in ['network', 'swinunet']:
                     image_tensor = TF.normalize(
                         image_tensor,
                         mean=[0.485, 0.456, 0.406],  # ImageNet mean
@@ -468,8 +610,11 @@ class UDiadsBibDataset(Dataset):
                 image, mask_class = self.transform(image, mask_class)
                 image_tensor = TF.to_tensor(image)
                 
-                # Apply ImageNet normalization for Hybrid1 (EfficientNet encoder)
-                if self.model_type and self.model_type.lower() == 'hybrid1':
+                # Apply ImageNet normalization for models with EfficientNet encoder
+                # Network model uses EfficientNet-B4 encoder (pretrained on ImageNet)
+                # Note: 'network' is the new name for the model previously called 'hybrid1'
+                # Hybrid2 uses Swin encoder, so it doesn't need ImageNet normalization
+                if self.model_type and self.model_type.lower() in ['network', 'swinunet']:
                     image_tensor = TF.normalize(
                         image_tensor,
                         mean=[0.485, 0.456, 0.406],  # ImageNet mean

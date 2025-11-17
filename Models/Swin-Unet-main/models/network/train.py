@@ -129,14 +129,20 @@ def setup_datasets(args):
             print(f"Warning: root directory ends with '_patched' but use_patched_data=False")
         
         # Create datasets
+        use_class_aware_aug = getattr(args, 'use_class_aware_aug', False)
+        if use_class_aware_aug:
+            print("✓ Class-aware augmentation enabled (stronger augmentation for rare classes)")
+            print("  Rare classes: Paratext, Decoration, Title, Chapter Headings")
+        
         train_dataset = UDiadsBibDataset(
             root_dir=root_dir,
             split='training',
             patch_size=args.img_size,
             use_patched_data=args.use_patched_data,
             manuscript=args.manuscript,
-            model_type='swinunet',
-            num_classes=num_classes
+            model_type='network',  # Network model (previously called 'hybrid1')
+            num_classes=num_classes,
+            use_class_aware_aug=use_class_aware_aug
         )
         
         val_dataset = UDiadsBibDataset(
@@ -145,8 +151,9 @@ def setup_datasets(args):
             patch_size=args.img_size,
             use_patched_data=args.use_patched_data,
             manuscript=args.manuscript,
-            model_type='swinunet',
-            num_classes=num_classes
+            model_type='network',  # Network model (previously called 'hybrid1')
+            num_classes=num_classes,
+            use_class_aware_aug=False  # Never use augmentation for validation
         )
         
     elif args.dataset == 'DIVAHISDB' and DIVAHISDB_AVAILABLE:
@@ -167,7 +174,7 @@ def setup_datasets(args):
             patch_size=args.img_size,
             use_patched_data=args.use_patched_data,
             manuscript=args.manuscript,
-            model_type='swinunet'
+            model_type='network'  # Network model (previously called 'hybrid1')
         )
         
         val_dataset = DivaHisDBDataset(
@@ -176,7 +183,7 @@ def setup_datasets(args):
             patch_size=args.img_size,
             use_patched_data=args.use_patched_data,
             manuscript=args.manuscript,
-            model_type='swinunet'
+            model_type='network'  # Network model (previously called 'hybrid1')
         )
         
     else:
@@ -293,6 +300,22 @@ def parse_arguments():
     parser.add_argument('--no_auto_resume', action='store_true', default=False,
                        help='Disable automatic resume from best_model_latest.pth (start fresh training)')
     
+    # Data sampling configuration
+    parser.add_argument('--use_balanced_sampler', action='store_true', default=False,
+                       help='Use balanced sampler to oversample rare classes (helps with class imbalance)')
+    
+    # Data augmentation configuration
+    parser.add_argument('--use_class_aware_aug', action='store_true', default=False,
+                       help='Use class-aware augmentation (stronger augmentation for rare classes like Title, Paratext, Decoration)')
+    
+    # Loss function configuration
+    parser.add_argument('--use_cb_loss', action='store_true', default=False,
+                       help='Use Class-Balanced Loss instead of standard CE (best for extreme imbalance >100:1)')
+    parser.add_argument('--cb_beta', type=float, default=0.9999,
+                       help='Beta hyperparameter for Class-Balanced Loss (default: 0.9999 for extreme imbalance)')
+    parser.add_argument('--focal_gamma', type=float, default=3.0,
+                       help='Focal loss gamma parameter (default: 3.0 for extreme imbalance with CB Loss, 4.0 for standalone use, 2.0 for moderate imbalance)')
+    
     return parser.parse_args()
 
 
@@ -318,6 +341,19 @@ def main():
     
     # Set up datasets
     train_dataset, val_dataset = setup_datasets(args)
+    
+    # Create balanced sampler if requested
+    if getattr(args, 'use_balanced_sampler', False):
+        from trainer import create_balanced_sampler
+        balanced_sampler = create_balanced_sampler(train_dataset, args.num_classes)
+        args.balanced_sampler = balanced_sampler
+        if balanced_sampler is not None:
+            print("✓ Balanced sampler enabled (oversampling rare classes)")
+        else:
+            print("⚠️  Balanced sampler requested but could not be created (using default shuffling)")
+            args.balanced_sampler = None
+    else:
+        args.balanced_sampler = None
     
     # Create model (no config needed for CNN-Transformer)
     model = get_model(args, None)

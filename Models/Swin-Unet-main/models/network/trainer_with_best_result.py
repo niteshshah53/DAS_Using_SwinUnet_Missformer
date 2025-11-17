@@ -15,7 +15,7 @@ import warnings
 # Add common directory to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../common'))
 
-from utils import DiceLoss, FocalLoss, ClassBalancedLoss
+from utils import DiceLoss, FocalLoss
 
 
 def setup_logging(output_path):
@@ -332,58 +332,32 @@ def create_balanced_sampler(train_dataset, num_classes, threshold=0.01, eps=1e-6
     return sampler
 
 
-def create_loss_functions(class_weights, num_classes, focal_gamma=3.0, use_cb_loss=False, cb_beta=0.9999):
+def create_loss_functions(class_weights, num_classes, focal_gamma=2.0):
     """
     Create properly weighted loss functions.
     Matches hybrid2's pattern.
     
     Args:
-        class_weights (torch.Tensor): Per-class weights (used only for CE/CB, not Focal)
+        class_weights (torch.Tensor): Per-class weights (used only for CE, not Focal)
         num_classes (int): Number of classes
-        focal_gamma (float): Focal loss focusing parameter (default: 3.0 for extreme imbalance with CB Loss, 4.0 for standalone use, 2.0 for moderate)
-        use_cb_loss (bool): Use Class-Balanced Loss instead of standard CE (best for extreme imbalance >100:1)
-        cb_beta (float): Beta hyperparameter for Class-Balanced Loss (default: 0.9999)
+        focal_gamma (float): Focal loss focusing parameter (default: 2.0)
         
     Returns:
         tuple: (ce_loss, focal_loss, dice_loss)
     """
-    # Conservative fix: Remove ignore_index to prevent training instability
-    # Synthetic pixels from affine transform padding will be treated as Background (class 0)
-    # This is acceptable since Background is the dominant class and these pixels are at borders
+    # CrossEntropyLoss with class weights (matching hybrid2: label_smoothing=0.1)
+    ce_loss = CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     
-    if use_cb_loss:
-        # Class-Balanced Loss (best for extreme imbalance >100:1)
-        # Based on "Class-Balanced Loss Based on Effective Number of Samples" (Cui et al., 2019)
-        ce_loss = ClassBalancedLoss(
-            class_weights=class_weights,
-            num_classes=num_classes,
-            beta=cb_beta,
-            label_smoothing=0.1
-            # No ignore_index - synthetic pixels treated as Background (class 0)
-        )
-        print(f"✓ Using Class-Balanced Loss (CB Loss) for extreme imbalance (beta={cb_beta})")
-        print(f"  CB Loss is best for class imbalance ratios >100:1")
-    else:
-        # Standard weighted CrossEntropyLoss (matching hybrid2: label_smoothing=0.1)
-        ce_loss = CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-        # No ignore_index - synthetic pixels treated as Background (class 0)
-    
-    # Focal loss with gamma parameter
-    # Note: Focal Loss paper (Lin et al., 2017) states:
-    #   - "For more imbalanced datasets, we recommend γ=3 or γ=4"
-    #   - "We do not use α-balancing when using γ=2"
-    #   - "When combining focal loss with other class balancing methods, use lower γ (2-3 instead of 4)"
-    # Default γ=3.0 when combined with CB Loss (conservative to prevent training instability)
-    # Use γ=4.0 for standalone Focal Loss (without CB Loss)
+    # Focal loss with moderate gamma (2.0 is standard, matching hybrid2)
+    # Note: Focal Loss paper (Lin et al., 2017) states: "We do not use α-balancing when using γ=2"
     # Focal Loss was designed to replace class weighting, not supplement it
     # Using class weights with Focal Loss double-penalizes rare classes and causes unstable gradients
-    focal_loss = FocalLoss(gamma=focal_gamma, weight=None)  # No class weights, no ignore_index
+    focal_loss = FocalLoss(gamma=focal_gamma, weight=None)  # No class weights!
     
     # Dice loss (handles class imbalance internally, matching hybrid2: no weight, no smooth)
     dice_loss = DiceLoss(num_classes)
     
-    if not use_cb_loss:
-        print(f"✓ Loss functions created: CE (weighted), Focal (γ={focal_gamma}, no weights), Dice")
+    print(f"✓ Loss functions created: CE (weighted), Focal (γ={focal_gamma}, no weights), Dice")
     
     return ce_loss, focal_loss, dice_loss
 
@@ -421,10 +395,9 @@ def compute_combined_loss(predictions, labels, ce_loss, focal_loss, dice_loss,
         loss_dict['dice'] = loss_dice.item()
         
         # Auxiliary losses with exponentially decaying weights (matching hybrid2 pattern)
-        # Further reduced weights for stability when using smart skip connections + CB Loss + aggressive augmentation
-        # Smart skip connections + deep supervision + CB Loss + Focal γ=4.0 can cause gradient explosion
-        # Reduced from 0.1 to 0.05 to prevent NaN/Inf gradients
-        aux_weights = [0.05 * (0.8 ** i) for i in range(len(aux_outputs))]
+        # Reduced weights for stability when using smart skip connections
+        # Smart skip connections + deep supervision can cause gradient explosion
+        aux_weights = [0.1 * (0.8 ** i) for i in range(len(aux_outputs))]
         aux_loss = 0.0
         
         for i, (weight, aux_output) in enumerate(zip(aux_weights, aux_outputs)):
@@ -917,14 +890,11 @@ def trainer_synapse(args, model, snapshot_path, train_dataset=None, val_dataset=
         print()
     
     # Create data loaders
-    # Use balanced sampler if provided (for oversampling rare classes)
-    sampler = getattr(args, 'balanced_sampler', None)
     train_loader, val_loader = create_data_loaders(
         train_dataset, val_dataset,
         args.batch_size * args.n_gpu,
         args.num_workers,
-        args.seed,
-        sampler=sampler
+        args.seed
     )
     
     print(f"📊 Dataset Statistics:")
@@ -944,15 +914,7 @@ def trainer_synapse(args, model, snapshot_path, train_dataset=None, val_dataset=
         class_weights = torch.ones(args.num_classes, device=device)
     
     # Create loss functions, optimizer, scheduler
-    use_cb_loss = getattr(args, 'use_cb_loss', False)
-    cb_beta = getattr(args, 'cb_beta', 0.9999)
-    focal_gamma = getattr(args, 'focal_gamma', 3.0)  # Default 3.0 for extreme imbalance with CB Loss (4.0 for standalone use)
-    ce_loss, focal_loss, dice_loss = create_loss_functions(
-        class_weights, args.num_classes, 
-        focal_gamma=focal_gamma,
-        use_cb_loss=use_cb_loss,
-        cb_beta=cb_beta
-    )
+    ce_loss, focal_loss, dice_loss = create_loss_functions(class_weights, args.num_classes)
     
     optimizer, scheduler = create_optimizer_and_scheduler(
         model, args.base_lr, args, train_loader
@@ -1387,15 +1349,11 @@ def trainer_synapse(args, model, snapshot_path, train_dataset=None, val_dataset=
                         # may not perfectly match original training. Official recommendation is to restart
                         # training or use epoch-based schedulers for resumable training.
                         if current_step > 0:
-                            # Fast-forward by setting internal state directly (much faster than stepping thousands of times)
-                            # This avoids the slow loop of scheduler.step() calls
-                            scheduler.last_epoch = current_step
-                            scheduler._step_count = current_step + 1
-                            # Update learning rates to match the current step
-                            scheduler.step()
-                            print(f"   ✓ Fast-forwarded OneCycleLR to step {current_step}/{total_steps} (using direct state setting)")
+                            # Fast-forward through all steps (don't just set last_epoch and step once)
+                            for _ in range(current_step):
+                                scheduler.step()
+                            print(f"   ✓ Fast-forwarded OneCycleLR by {current_step} steps (resumed from step {current_step}/{total_steps})")
                             print(f"   ⚠️  Note: OneCycleLR resumption may not perfectly match original training due to stateful nature")
-                            print(f"   💡 Recommendation: Use CosineAnnealingWarmRestarts for resumable training instead")
                         else:
                             print(f"   ✓ Recreated OneCycleLR scheduler (starting from step 0/{total_steps})")
                     elif scheduler_type == 'CosineAnnealingLR':

@@ -26,6 +26,143 @@ class FocalLoss(nn.Module):
         pt = torch.exp(-ce_loss)
         focal_loss = (1 - pt) ** self.gamma * ce_loss
         return focal_loss.mean()
+
+
+class ClassBalancedLoss(nn.Module):
+    """
+    Class-Balanced Loss for extreme class imbalance.
+    
+    Based on "Class-Balanced Loss Based on Effective Number of Samples" (Cui et al., 2019).
+    Best for extreme imbalance (>100:1 ratio).
+    
+    Formula: CB_loss = (1 - beta) / (1 - beta^n_i) * CE_loss
+    where:
+    - beta: hyperparameter (typically 0.9999 for extreme imbalance)
+    - n_i: number of samples for class i
+    - The re-weighting factor is (1 - beta) / (1 - beta^n_i)
+    
+    Note: This implementation uses class_weights that are already computed using ENS (Effective
+    Number of Samples) formula. The weights are applied per-pixel based on the pixel's class,
+    providing fine-grained re-weighting compared to global CE weighting.
+    
+    Args:
+        class_weights: Per-class weights (typically computed using ENS formula from class frequencies)
+        num_classes: Number of classes
+        beta: Hyperparameter for effective number (default: 0.9999, kept for compatibility but not used if weights are pre-computed)
+        ignore_index: Class index to ignore in loss computation
+        label_smoothing: Label smoothing factor (default: 0.1)
+    """
+    def __init__(self, class_weights, num_classes, beta=0.9999, ignore_index=None, label_smoothing=0.1):
+        super(ClassBalancedLoss, self).__init__()
+        self.num_classes = num_classes
+        self.beta = beta
+        self.ignore_index = ignore_index
+        self.label_smoothing = label_smoothing
+        
+        # Use class_weights directly as CB weights
+        # Note: class_weights are typically already computed using ENS formula: (1-beta) / (1-beta^n_i)
+        # So we can use them directly, but normalize to ensure stability
+        if class_weights is not None:
+            if isinstance(class_weights, torch.Tensor):
+                self.cb_weights = class_weights.clone().detach()
+            else:
+                self.cb_weights = torch.tensor(class_weights, dtype=torch.float32)
+            
+            # Normalize CB weights to have mean=1 for stability (prevents loss scale issues)
+            mean_weight = self.cb_weights.mean().item()
+            if mean_weight > 1e-8:
+                self.cb_weights = self.cb_weights / mean_weight
+        else:
+            # Uniform weights if no class weights provided
+            self.cb_weights = torch.ones(num_classes, dtype=torch.float32)
+        
+        # Move to device when forward is called
+        self._device = None
+    
+    def forward(self, input, target):
+        """
+        Forward pass of Class-Balanced Loss.
+        
+        Args:
+            input: Model predictions [B, C, H, W] or [B, C]
+            target: Ground truth labels [B, H, W] or [B]
+        
+        Returns:
+            Scalar loss value
+        """
+        # Move weights to same device as input
+        if self._device != input.device:
+            self.cb_weights = self.cb_weights.to(input.device)
+            self._device = input.device
+        
+        # Compute standard cross-entropy loss per sample
+        if self.ignore_index is not None:
+            ce_loss = F.cross_entropy(
+                input, target, 
+                weight=None,  # Don't use weight here, we'll apply CB weights manually
+                ignore_index=self.ignore_index,
+                label_smoothing=self.label_smoothing,
+                reduction='none'
+            )
+        else:
+            ce_loss = F.cross_entropy(
+                input, target,
+                weight=None,
+                label_smoothing=self.label_smoothing,
+                reduction='none'
+            )
+        
+        # Apply class-balanced re-weighting per pixel/sample
+        # Get class indices for each pixel/sample
+        if len(target.shape) == 3:  # [B, H, W] - segmentation
+            # Flatten for easier indexing
+            target_flat = target.view(-1)  # [B*H*W]
+            ce_loss_flat = ce_loss.view(-1)  # [B*H*W]
+            
+            # Create mask for valid pixels (exclude ignore_index if specified)
+            if self.ignore_index is not None:
+                valid_mask = (target_flat != self.ignore_index)
+            else:
+                valid_mask = torch.ones_like(target_flat, dtype=torch.bool)
+            
+            # Get CB weight for each pixel's class
+            # Use 0 weight for ignore_index pixels (they'll be masked out)
+            cb_weights_per_pixel = torch.zeros_like(ce_loss_flat)
+            if valid_mask.any():
+                # Clamp target indices to valid range to avoid index errors
+                target_clamped = torch.clamp(target_flat, 0, self.num_classes - 1)
+                cb_weights_per_pixel[valid_mask] = self.cb_weights[target_clamped[valid_mask]]
+            
+            # Apply re-weighting
+            cb_loss_flat = ce_loss_flat * cb_weights_per_pixel
+            
+            # Average over valid pixels only
+            if valid_mask.any():
+                return cb_loss_flat[valid_mask].mean()
+            else:
+                return torch.tensor(0.0, device=input.device, dtype=input.dtype)
+        else:  # [B] - classification
+            # Create mask for valid samples (exclude ignore_index if specified)
+            if self.ignore_index is not None:
+                valid_mask = (target != self.ignore_index)
+            else:
+                valid_mask = torch.ones_like(target, dtype=torch.bool)
+            
+            # Get CB weight for each sample's class
+            cb_weights_per_sample = torch.zeros_like(ce_loss)
+            if valid_mask.any():
+                # Clamp target indices to valid range
+                target_clamped = torch.clamp(target, 0, self.num_classes - 1)
+                cb_weights_per_sample[valid_mask] = self.cb_weights[target_clamped[valid_mask]]
+            
+            # Apply re-weighting
+            cb_loss = ce_loss * cb_weights_per_sample
+            
+            # Average over valid samples only
+            if valid_mask.any():
+                return cb_loss[valid_mask].mean()
+            else:
+                return torch.tensor(0.0, device=input.device, dtype=input.dtype)
     
 
 class DiceLoss(nn.Module):

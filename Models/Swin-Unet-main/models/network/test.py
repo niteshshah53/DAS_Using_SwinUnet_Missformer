@@ -19,6 +19,7 @@ import torch.backends.cudnn as cudnn
 from PIL import Image
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
+import torchvision.transforms.functional as TF
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../common'))
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../'))
@@ -57,29 +58,29 @@ Examples:
                        help='Input patch size for inference')
     parser.add_argument('--batch_size', type=int, default=24,
                        help='Batch size for testing')
-    # Baseline flag (matching train.py)
-    parser.add_argument('--use_baseline', action='store_true', default=False,
-                       help='Use baseline CNN-Transformer (EfficientNet-B4 encoder + bottleneck + Swin decoder)')
-    
-    # Baseline enhancement flags (matching train.py, only used with --use_baseline)
-    parser.add_argument('--deep_supervision', action='store_true', default=False, 
-                       help='Enable deep supervision with 3 auxiliary outputs (requires --use_baseline)')
+    # Architecture flags (all independent, matching train.py)
+    parser.add_argument('--bottleneck', action='store_true', default=True,
+                       help='Enable bottleneck with 2 Swin Transformer blocks (default: True)')
+    parser.add_argument('--no_bottleneck', dest='bottleneck', action='store_false',
+                       help='Disable bottleneck')
+    parser.add_argument('--adapter_mode', type=str, default='streaming',
+                       choices=['external', 'streaming'],
+                       help='Adapter placement mode: external (separate adapters) or streaming (integrated adapters) (default: streaming)')
     parser.add_argument('--fusion_method', type=str, default='simple',
                        choices=['simple', 'fourier', 'smart'],
-                       help='Feature fusion: simple (concat), fourier (FFT-based), smart (attention-based smart skip connections) (requires --use_baseline)')
+                       help='Feature fusion method: simple (concat), fourier (FFT-based), smart (attention-based smart skip connections) (default: simple)')
+    parser.add_argument('--deep_supervision', action='store_true', default=False,
+                       help='Enable deep supervision with 3 auxiliary outputs (default: False)')
     parser.add_argument('--use_multiscale_agg', action='store_true', default=False,
-                       help='Enable multi-scale aggregation in bottleneck (requires --use_baseline)')
+                       help='Enable multi-scale aggregation in bottleneck (default: False)')
     parser.add_argument('--use_groupnorm', action='store_true', default=True,
-                       help='Use GroupNorm instead of LayerNorm (default: True for baseline, requires --use_baseline)')
+                       help='Use GroupNorm instead of LayerNorm (default: True)')
     parser.add_argument('--no_groupnorm', dest='use_groupnorm', action='store_false',
                        help='Disable GroupNorm (use LayerNorm instead)')
     
-    # Legacy flags (for backward compatibility, ignored when --use_baseline is set)
-    parser.add_argument('--adapter_mode', type=str, default='external', 
-                       choices=['external', 'streaming'],
-                       help='[DEPRECATED: Use --use_baseline instead] Adapter placement mode')
-    parser.add_argument('--bottleneck', action='store_true', default=False,
-                       help='[DEPRECATED: Use --use_baseline instead] Enable bottleneck with 2 Swin blocks')
+    # Legacy flag (kept for backward compatibility, but not used)
+    parser.add_argument('--use_baseline', action='store_true', default=False,
+                       help='[DEPRECATED: All flags are now independent] Use baseline CNN-Transformer configuration')
     
     parser.add_argument('--freeze_encoder', action='store_true', default=False,
                        help='Freeze encoder during testing')
@@ -125,84 +126,53 @@ def validate_arguments(args):
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
     
-    # Validate baseline flag usage (matching train.py)
-    use_baseline = getattr(args, 'use_baseline', False)
-    
-    # Component flags that should only work with --use_baseline
-    component_flags = [
-        ('use_deep_supervision', getattr(args, 'deep_supervision', False)),
-        ('use_fourier_fusion', getattr(args, 'fusion_method', 'simple') == 'fourier'),
-        ('use_smart_fusion', getattr(args, 'fusion_method', 'simple') == 'smart'),
-        ('use_multiscale_agg', getattr(args, 'use_multiscale_agg', False)),
-        ('use_groupnorm', getattr(args, 'use_groupnorm', False) if not use_baseline else False),
-    ]
-    
-    # Check if component flags are used without --use_baseline
-    if not use_baseline:
-        used_flags = [name for name, used in component_flags if used]
-        if used_flags:
-            logging.warning(f"Component flags {used_flags} are typically used with --use_baseline flag")
-            logging.warning("Consider using --use_baseline for baseline configuration")
-    
-    # Warn if legacy flags are used with --use_baseline
-    if use_baseline:
-        if getattr(args, 'adapter_mode', 'external') != 'external' or getattr(args, 'bottleneck', False):
-            logging.warning("--use_baseline is set: --adapter_mode and --bottleneck flags will be ignored")
-            logging.warning("Baseline uses: adapter_mode='streaming', bottleneck=True")
+    # All architecture flags are independent (matching train.py)
+    # No need to validate use_baseline flag - all flags work independently
 
 
 def get_model(args, config):
-    """Create and load the CNN-Transformer model."""
+    """
+    Create and load the CNN-Transformer model.
+    
+    All architecture flags are independent and can be combined freely (matching train.py).
+    """
     from vision_transformer_cnn import CNNTransformerUnet as ViT_seg
     
-    use_baseline = getattr(args, 'use_baseline', False)
+    # Get all model configuration from args (all flags are independent, matching train.py)
+    use_bottleneck = getattr(args, 'bottleneck', True)
+    adapter_mode = getattr(args, 'adapter_mode', 'streaming')
+    fusion_method = getattr(args, 'fusion_method', 'simple')
+    use_deep_supervision = getattr(args, 'deep_supervision', False)
+    use_multiscale_agg = getattr(args, 'use_multiscale_agg', False)
+    use_groupnorm = getattr(args, 'use_groupnorm', True)
     
-    if use_baseline:
-        print("=" * 80)
-        print("🚀 Loading CNN-Transformer BASELINE for Testing")
-        print("=" * 80)
-        print("Baseline Configuration:")
-        print("  ✓ EfficientNet-B4 Encoder")
-        print("  ✓ Bottleneck: 2 Swin Transformer blocks")
-        print("  ✓ Swin Transformer Decoder")
-        print("  ✓ Simple concatenation skip connections")
-        print("  ✓ Adapter mode: streaming (default)")
-        print("  ✓ GroupNorm: {}".format(getattr(args, 'use_groupnorm', True)))
-        print("=" * 80)
-        
-        # Baseline defaults (matching train.py exactly)
-        adapter_mode = 'streaming'  # Default for baseline
-        use_bottleneck = True  # Always enabled for baseline
-        fusion_method = getattr(args, 'fusion_method', 'simple')
-        
-        model = ViT_seg(
-            None,
-            img_size=args.img_size,
-            num_classes=args.num_classes,
-            use_deep_supervision=getattr(args, 'deep_supervision', False),
-            fusion_method=fusion_method,
-            use_bottleneck=use_bottleneck,
-            adapter_mode=adapter_mode,
-            use_multiscale_agg=getattr(args, 'use_multiscale_agg', False),
-            use_groupnorm=getattr(args, 'use_groupnorm', True)  # Default True for baseline (matching train.py)
-        )
-    else:
-        # Original non-baseline mode (backward compatibility)
-        # Use legacy flags if provided, otherwise use defaults
-        adapter_mode = getattr(args, 'adapter_mode', 'external')
-        use_bottleneck = getattr(args, 'bottleneck', False)
-        
-        model = ViT_seg(
-            None,
-            img_size=args.img_size,
-            num_classes=args.num_classes,
-            use_deep_supervision=getattr(args, 'deep_supervision', False),
-            fusion_method=getattr(args, 'fusion_method', 'simple'),
-            use_bottleneck=use_bottleneck,
-            adapter_mode=adapter_mode,
-            use_multiscale_agg=getattr(args, 'use_multiscale_agg', False),
-            use_groupnorm=getattr(args, 'use_groupnorm', False)  # Default False for non-baseline
-        )
+    # Print configuration (matching train.py format)
+    print("=" * 80)
+    print("🚀 Loading CNN-Transformer Model for Testing")
+    print("=" * 80)
+    print("Model Configuration:")
+    print("  ✓ EfficientNet-B4 Encoder")
+    print(f"  ✓ Bottleneck: {'Enabled' if use_bottleneck else 'Disabled'}")
+    print("  ✓ Swin Transformer Decoder")
+    print(f"  ✓ Fusion Method: {fusion_method}")
+    print(f"  ✓ Adapter Mode: {adapter_mode}")
+    print(f"  ✓ Deep Supervision: {'Enabled' if use_deep_supervision else 'Disabled'}")
+    print(f"  ✓ Multi-Scale Aggregation: {'Enabled' if use_multiscale_agg else 'Disabled'}")
+    print(f"  ✓ Normalization: {'GroupNorm' if use_groupnorm else 'LayerNorm'}")
+    print("=" * 80)
+    
+    # Create model with all flags (all independent and compatible, matching train.py)
+    model = ViT_seg(
+        None,
+        img_size=args.img_size,
+        num_classes=args.num_classes,
+        use_deep_supervision=use_deep_supervision,
+        fusion_method=fusion_method,
+        use_bottleneck=use_bottleneck,
+        adapter_mode=adapter_mode,
+        use_multiscale_agg=use_multiscale_agg,
+        use_groupnorm=use_groupnorm
+    )
     
     if torch.cuda.is_available():
         model = model.cuda()
@@ -309,19 +279,34 @@ def load_model_checkpoint(model, args):
     multiscale_mismatch = (has_multiscale_agg != model.model.use_multiscale_agg)
     
     if ds_mismatch or fusion_mismatch or bottleneck_mismatch or adapter_mismatch or multiscale_mismatch:
-        logging.info("Checkpoint and model have architecture differences - loading with strict=False")
+        print("⚠️  WARNING: Checkpoint and model have architecture differences!")
+        print(f"   Deep Supervision mismatch: {ds_mismatch}")
+        print(f"   Fusion mismatch: {fusion_mismatch}")
+        print(f"   Bottleneck mismatch: {bottleneck_mismatch}")
+        print(f"   Adapter mismatch: {adapter_mismatch}")
+        print(f"   Multi-scale mismatch: {multiscale_mismatch}")
+        print("   Loading with strict=False (some weights may not load correctly)")
+        logging.warning("Checkpoint and model have architecture differences - loading with strict=False")
+        logging.warning(f"  Deep Supervision: {ds_mismatch}, Fusion: {fusion_mismatch}, Bottleneck: {bottleneck_mismatch}, Adapter: {adapter_mismatch}, Multi-scale: {multiscale_mismatch}")
         msg = model.load_state_dict(model_state_dict, strict=False)
         
         if msg.unexpected_keys:
+            print(f"⚠️  Ignored {len(msg.unexpected_keys)} unexpected keys in checkpoint")
             logging.warning(f"Ignored {len(msg.unexpected_keys)} unexpected keys")
         if msg.missing_keys:
             missing_fusion = [k for k in msg.missing_keys if 'skip_fusions' in k or 'smart_skips' in k]
             missing_other = [k for k in msg.missing_keys if 'skip_fusions' not in k and 'smart_skips' not in k]
             if missing_fusion:
+                print(f"⚠️  Missing {len(missing_fusion)} fusion-related keys (expected if fusion method differs)")
                 logging.warning(f"Missing {len(missing_fusion)} fusion-related keys")
             if missing_other:
-                logging.warning(f"Missing {len(missing_other)} other keys")
+                print(f"⚠️  CRITICAL: Missing {len(missing_other)} other keys - model may not work correctly!")
+                logging.error(f"Missing {len(missing_other)} other keys - model may not work correctly!")
+                if len(missing_other) > 10:
+                    print(f"   First 10 missing keys: {missing_other[:10]}")
     else:
+        print("✓ Checkpoint architecture matches model - loading with strict=True")
+        logging.info("Checkpoint architecture matches model - loading with strict=True")
         model.load_state_dict(model_state_dict, strict=True)
     
     return os.path.basename(checkpoint_path)
@@ -687,7 +672,15 @@ def stitch_patches(patches, patch_positions, max_x, max_y, patches_per_row, patc
                 # Convert to numpy immediately to avoid memory leak (PIL Image not explicitly closed)
                 # This prevents memory accumulation in long testing loops (100+ images)
                 patch_np = np.array(Image.open(patch_path).convert("RGB"))
-                patch_tensor = TF.to_tensor(patch_np)
+                patch_tensor = TF.to_tensor(patch_np)  # Normalizes to [0, 1]
+                # CRITICAL: Apply ImageNet normalization to match training preprocessing
+                # The model uses EfficientNet-B4 encoder (pretrained on ImageNet)
+                # Without this normalization, the model receives wrong input distribution
+                patch_tensor = TF.normalize(
+                    patch_tensor,
+                    mean=[0.485, 0.456, 0.406],  # ImageNet mean
+                    std=[0.229, 0.224, 0.225]    # ImageNet std
+                )
                 batch_tensors.append(patch_tensor)
                 batch_positions.append(patch_positions[patch_path])
             
@@ -737,7 +730,15 @@ def stitch_patches(patches, patch_positions, max_x, max_y, patches_per_row, patc
                 # Convert to numpy immediately to avoid memory leak (PIL Image not explicitly closed)
                 # This prevents memory accumulation in long testing loops (100+ images)
                 patch_np = np.array(Image.open(patch_path).convert("RGB"))
-                patch_tensor = TF.to_tensor(patch_np)
+                patch_tensor = TF.to_tensor(patch_np)  # Normalizes to [0, 1]
+                # CRITICAL: Apply ImageNet normalization to match training preprocessing
+                # The model uses EfficientNet-B4 encoder (pretrained on ImageNet)
+                # Without this normalization, the model receives wrong input distribution
+                patch_tensor = TF.normalize(
+                    patch_tensor,
+                    mean=[0.485, 0.456, 0.406],  # ImageNet mean
+                    std=[0.229, 0.224, 0.225]    # ImageNet std
+                )
                 batch_tensors.append(patch_tensor)
                 batch_positions.append(patch_positions[patch_path])
             
